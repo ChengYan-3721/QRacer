@@ -1,0 +1,31 @@
+[package]
+name = "qracer"
+version = "0.1.0"
+edition = "2024"
+description = "QR / WeChat mini-program / Douyin code screenshot vectorizer for prepress"
+
+[dependencies]
+# GUI
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
+egui_extras = { version = "0.32", features = ["image"] }
+
+# 图像编解码（PNG/JPG/BMP/WebP）
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+imageproc = "0.25"
+nalgebra = "0.33"
+
+# 剪贴板：阶段 1 用 arboard 读取剪贴板图像
+# 阶段 6 写 EMF 到剪贴板时再加 clipboard-win + windows
+arboard = "3"
+windows-sys = { version = "0.60", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
+# 文件对话框
+rfd = "0.15"
+
+# 错误处理
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+qrcodegen = "1.8"

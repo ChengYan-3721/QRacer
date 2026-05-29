@@ -1,0 +1,32 @@
+// 顶部工具栏：粘贴 / 打开 / 导出 / 复制 + 码类型显示。
+//
+// 阶段 1：粘贴和打开真实工作；导出/复制按钮渲染但禁用。
+
+use crate::app::QRacerApp;
+use eframe::egui;
+
+pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("粘贴 (Ctrl+V)").clicked() {
+            app.try_paste_from_clipboard();
+        }
+        if ui.button("打开...").clicked() {
+            app.try_open_file();
+        }
+
+        ui.separator();
+
+        // 阶段 1：未实现的按钮显示但禁用，让用户看到完整流程预期
+        ui.add_enabled(false, egui::Button::new("导出 SVG"));
+        ui.add_enabled(false, egui::Button::new("复制矢量"));
+
+        ui.separator();
+
+        ui.label("码类型：");
+        ui.label(
+            egui::RichText::new(app.code_kind.label())
+                .strong()
+                .color(egui::Color32::from_rgb(60, 130, 220)),
+        );
+    });
+}
