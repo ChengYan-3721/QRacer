@@ -5,11 +5,13 @@
 
 mod app;
 mod code_kind;
+mod codec;
 mod detect;
 mod error;
 mod image_io;
 mod pipeline;
 mod ui;
+mod vector;
 
 use app::QRacerApp;
 

@@ -16,8 +16,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
 
         ui.separator();
 
-        // 阶段 1：未实现的按钮显示但禁用，让用户看到完整流程预期
-        ui.add_enabled(false, egui::Button::new("导出 SVG"));
+        if ui
+            .add_enabled(app.last_svg.is_some(), egui::Button::new("导出 SVG"))
+            .clicked()
+        {
+            app.try_export_svg();
+        }
         ui.add_enabled(false, egui::Button::new("复制矢量"));
 
         ui.separator();

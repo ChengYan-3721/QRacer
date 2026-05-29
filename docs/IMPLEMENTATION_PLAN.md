@@ -1,7 +1,7 @@
 # QRacer 分步实施计划
 
 > 文档版本：v1.0  
-> 最后更新：2026-05-28  
+> 最后更新：2026-05-29  
 > 适用对象：AI 开发者（自主执行）+ 人类审阅者
 
 本文档把 [ARCHITECTURE.md](./ARCHITECTURE.md) 的路线图拆解为可单独 PR / 单独执行的任务。**每个任务包含：依赖、目标、详细步骤、文件清单、验收标准**。AI 开发者可以按顺序读、直接照做。
@@ -324,7 +324,27 @@ fn warp_synthetic_qr_recovers_modules() {
 
 ---
 
-## 阶段 3：QR 主路线（解码 + 8 掩膜重生成 + 差异高亮）
+## 阶段 3：QR 主路线（解码 + 8 掩膜重生成 + 差异高亮）（已完成）
+
+**完成记录（2026-05-29）**：
+- 已新增 `rxing`、`qrcodegen` 为运行时依赖，`qrcodegen` 现在同时服务合成测试和 QR 重生成
+- 已新增 `src/codec/{mod,qr}.rs`：使用 `rxing::MultiFormatReader` 解码 QR 文本/ECC；从校正图 format info 读取原始掩膜；通过 finder/timing/format 区评分推断 QR 版本
+- 已实现 `regenerate_qr()`：按解码文本、版本、纠错等级和指定 mask 0-7 调用 `qrcodegen::encode_segments_advanced()` 重生成模块矩阵
+- 已新增 `src/vector/{mod,svg,diff,shapes}.rs`：输出 QR SVG；按校正图模块中心多数投票计算差异；右侧预览中用红色标记"原图有、生成图没有"，用蓝色标记"原图没有、生成图有"
+- 已新增 `src/ui/mask_panel.rs` 并接入 `QRacerApp`：支持 0-7 掩膜单选、自动选择差异最少掩膜、显示/隐藏差异开关、显示版本/ECC/原始掩膜/差异模块数
+- 已启用工具栏"导出 SVG"按钮：生成成功后可保存 `.svg` 文件；"复制矢量"仍留到阶段 6 的 EMF 剪贴板实现
+- "网格兜底"按钮已作为阶段 4 占位接入，当前不执行采样兜底
+
+**验证已通过**：
+- `cargo fmt --check`
+- `cargo test`（21 个单元测试通过）
+- `cargo build`
+- `cargo clippy --no-deps -- -D warnings`
+
+**仍需人工/样本验收**：
+- 当前仍缺少 `assets/samples/` 真实 QR 截图 fixture；阶段 3 自动化验证使用 `qrcodegen` 合成 QR 样本
+- 真实截图中的复杂编码模式（如 ECI/Kanji/非 UTF-8 字节段）可能无法由 `qrcodegen::QrSegment::make_segments()` 1:1 复现，后续需要真实样本确认并决定是否扩展段级解码
+- 原图坐标系上的半透明差异叠加还未做；当前阶段 3 在右侧矢量预览中用红/蓝颜色区分差异模块，原图反投影叠加可在保留 homography 后扩展
 
 ### 任务 3.1：新增依赖
 
@@ -572,7 +592,23 @@ fn svg_module_count_matches() {
 
 ---
 
-## 阶段 4：QR 网格兜底
+## 阶段 4：QR 网格兜底（已完成）
+
+**完成记录（2026-05-29）**：
+- 已新增 `src/codec/qr_grid.rs`：通过阶段 3 的 QR 版本推断能力识别模块数，并在校正图上按模块中心 3×3 多数投票采样生成 `QrMatrix`
+- 已接通 `MaskChoice::GridFallback`：点击"网格兜底"后不再走 `qrcodegen` 重生成，而是直接采样校正图生成 SVG 和右侧预览
+- 已支持"解码失败但版本可推断"场景：阶段 2 校正成功后，即使 QR payload 解码失败，UI 仍显示"网格兜底"入口
+- 掩膜单选和"自动选最佳"在未解码时禁用；"网格兜底"只依赖校正图和版本推断
+
+**验证已通过**：
+- `cargo fmt --check`
+- `cargo test`（23 个单元测试通过）
+- `cargo build`
+- `cargo clippy --no-deps -- -D warnings`
+
+**仍需人工/样本验收**：
+- 当前仍缺少真实损坏 QR 截图 fixture；自动化验证使用 `qrcodegen` 合成无噪 QR 并确认采样矩阵 1:1 等于原矩阵
+- 标准 `cargo build` 若被正在运行的 `target\debug\qracer.exe` 占用，会在最终验证时改用独立 target 目录确认构建
 
 ### 任务 4.1：网格采样实现
 

@@ -15,6 +15,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 imageproc = "0.25"
 nalgebra = "0.33"
 
+# QR decode/regenerate
+rxing = "0.7"
+qrcodegen = "1.8"
+
 # 剪贴板：阶段 1 用 arboard 读取剪贴板图像
 # 阶段 6 写 EMF 到剪贴板时再加 clipboard-win + windows
 arboard = "3"
@@ -26,6 +30,3 @@ rfd = "0.15"
 # 错误处理
 anyhow = "1"
 thiserror = "2"
-
-[dev-dependencies]
-qrcodegen = "1.8"

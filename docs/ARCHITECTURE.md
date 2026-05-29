@@ -1,8 +1,8 @@
 # QRacer 架构文档
 
 > 文档版本：v1.0  
-> 最后更新：2026-05-28  
-> 项目状态：阶段 2（预处理 + QR 定位 + 透视校正）已完成
+> 最后更新：2026-05-29  
+> 项目状态：阶段 4（QR 网格兜底）已完成
 
 ---
 
@@ -168,8 +168,8 @@ src/
 │   ├── mod.rs
 │   ├── qr.rs                 主路线：rxing 解码 + qrcodegen 8 掩膜重生成
 │   ├── qr_grid.rs            兜底：QR 网格采样
-│   ├── wx_grid.rs            小程序码：径向网格采样
-│   └── dy_grid.rs            抖音码：同心圆采样
+│   ├── wx_grid.rs            (阶段 5) 小程序码：径向网格采样
+│   └── dy_grid.rs            (阶段 6) 抖音码：同心圆采样
 │
 ├── vector/                   SVG 输出
 │   ├── mod.rs
@@ -181,7 +181,7 @@ src/
 │   ├── mod.rs
 │   └── emf.rs                经典 EMF 生成 + CF_ENHMETAFILE 写入
 │
-└── job/                      (阶段 3 引入) 后台任务运行器
+└── job/                      (阶段 7 可选) 后台任务运行器
     ├── mod.rs
     └── runner.rs             std::sync::mpsc + 线程，避免阻塞 UI
 ```
@@ -205,9 +205,12 @@ pub struct QRacerApp {
 
     // 阶段 3+ 增加：
     pub mask_choice: MaskChoice,           // 当前选用的掩膜 0-7 或网格兜底
+    pub last_decoded: Option<QrDecoded>,   // 最近一次 QR 解码结果
+    pub qr_version: Option<u8>,            // 最近一次推断的 QR 版本，解码失败时仍可用于网格兜底
+    pub last_matrix: Option<QrMatrix>,     // 最近一次重生成模块矩阵
     pub last_svg: Option<String>,          // 最近生成的 SVG 文本
-    pub diff_overlay: Option<egui::ColorImage>, // 差异叠加层
-    pub job_runner: JobRunner,             // 后台任务（识别/重生成）
+    pub last_diff_count: Option<u32>,      // 与校正图不一致的模块数
+    pub show_diff_overlay: bool,           // 是否在右侧预览显示红/蓝差异模块
 }
 ```
 
@@ -296,12 +299,13 @@ pub struct RingSpec {
 **目标**：不解码，直接在校正后图上采样每个模块。
 
 ```
-1. 已知 QR 版本 → size = (version-1)*4 + 21
+1. 从校正图 finder/timing/format 区评分推断 QR 版本 → size = (version-1)*4 + 21
 2. 每模块边长 = 目标图边长 / size
 3. 对每个 (i, j)：
    - 取 3x3 中心子区域，多数投票（>=5 黑即判黑）
    - 写入 modules[i*size + j]
-4. 输出：SVG 由 size*size 个 rect 拼成
+4. 输出：SVG 由 size*size 个 rect 拼成；右侧预览与校正图比较差异
+5. UI 中解码失败但版本可推断时，仍允许点击"网格兜底"
 ```
 
 ### 5.4 小程序码径向采样
@@ -327,10 +331,11 @@ pub struct RingSpec {
 
 ### 5.6 差异高亮
 ```
-1. 把生成的 SVG 用 resvg / 内部光栅化器渲染成与原图同尺寸的位图
-2. 二值化后与原图二值像素逐位 XOR
-3. XOR=1 的像素叠加在原图预览侧，用半透明红色显示
-4. 状态栏显示差异像素数 / 模块数
+1. 阶段 3 已实现模块级对比：按 QR 版本把校正图分成 NxN 模块
+2. 每个模块取中心 3x3 多数投票，与 qrcodegen 重生成矩阵比较
+3. 原图黑、生成图白的模块染红；原图白、生成图黑的模块染蓝
+4. 掩膜面板提供"显示差异"开关；状态栏在差异模块数后写明红/蓝含义
+5. 原图坐标系半透明叠加需要保留 homography 后再做反投影，可作为后续增强
 ```
 
 ---
@@ -366,8 +371,10 @@ pub enum QRacerError {
 ### 7.1 阶段 1：单线程
 所有操作（粘贴、打开、显示）在 UI 线程同步完成。粘贴/打开几十毫秒，可接受。
 
-### 7.2 阶段 3+ 引入后台任务
-**触发场景**：识别 + 8 掩膜对比，可能耗时数秒。
+### 7.2 阶段 7 可选后台任务
+阶段 3 当前采用同步执行：QR 解码、8 掩膜对比和 SVG 生成在现有样本规模下可接受。
+
+**触发场景**：用户反馈"自动选最佳掩膜"或复杂截图识别导致 UI 冻结超过 500ms。
 
 ```rust
 pub struct JobRunner {
@@ -397,7 +404,9 @@ UI 线程每帧 `try_recv()` 拉结果，不阻塞。
 ### 8.1 单元测试
 - `detect/finder_qr.rs`：用合成 QR 图（`qrcodegen` 生成）验证 finder 检测
 - `pipeline/preprocess.rs`：Otsu 阈值在已知样本上的稳定性
-- `codec/qr.rs`：解码再生成的双向闭环（不带掩膜重选）
+- `codec/qr.rs`：解码再生成的双向闭环、format info 掩膜读取、版本推断
+- `codec/qr_grid.rs`：按校正图采样恢复 QR 模块矩阵、版本推断兜底
+- `vector/{svg,diff}.rs`：SVG rect 输出、模块差异统计、红/蓝分类差异预览
 
 ### 8.2 集成测试 / fixture
 `tests/fixtures/` 存放用户真实截图：
@@ -464,6 +473,9 @@ panic = "abort"        # 不要展开
 | 2026-05-28 | EMF 剪贴板（经典） | EMF+ / SVG MIME | AI 兼容性最稳 |
 | 2026-05-28 | 不依赖 OpenCV | `opencv` crate | 保持单二进制分发 |
 | 2026-05-29 | Windows 前台按键轮询补齐图片粘贴快捷键 | 仅依赖 egui `Key::V`/`Paste` 事件 | egui-winit 对图片剪贴板 `Ctrl+V` 会吞掉按键且不产生文本粘贴事件 |
+| 2026-05-29 | 阶段 3 先同步执行，不引入后台任务器 | 立即引入 `job::runner` + mpsc | 当前 QR 解码和 8 掩膜对比耗时低，阶段 7 按卡顿反馈再加线程模型 |
+| 2026-05-29 | 从校正图 format info 自读 QR 原始掩膜 | 依赖 rxing 元数据 | rxing 不稳定暴露 mask；QR format 区坐标固定，自读可控 |
+| 2026-05-29 | QR 网格兜底只依赖校正图 + 版本推断 | 必须先解码 QR payload | 可处理 payload 解码失败或重生成不可靠的截图，优先保证几何 1:1 |
 
 未来重大变更应追加在此表。
 
@@ -475,8 +487,8 @@ panic = "abort"        # 不要展开
 |---|---|---|
 | 1 | GUI 骨架、粘贴/打开、左右对比占位 | ✅ 完成 |
 | 2 | 预处理 + QR finder 检测 + 透视校正 | ✅ 完成 |
-| 3 | QR 主路线：解码 + 8 掩膜重生成 + 差异高亮 | 待 |
-| 4 | QR 网格兜底 | 待 |
+| 3 | QR 主路线：解码 + 8 掩膜重生成 + 差异高亮 | ✅ 完成 |
+| 4 | QR 网格兜底 | ✅ 完成 |
 | 5 | 小程序码识别与采样 | 待 |
 | 6 | 抖音码 + EMF 剪贴板 + 打包优化 | 待 |
 
