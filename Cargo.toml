@@ -22,7 +22,13 @@ qrcodegen = "1.8"
 # 剪贴板：阶段 1 用 arboard 读取剪贴板图像
 # 阶段 6 写 EMF 到剪贴板时再加 clipboard-win + windows
 arboard = "3"
-windows-sys = { version = "0.60", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # 文件对话框
 rfd = "0.15"

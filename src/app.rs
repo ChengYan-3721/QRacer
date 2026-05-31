@@ -9,16 +9,36 @@
 use crate::code_kind::CodeKind;
 use crate::codec::qr::{QrDecoded, QrMatrix, decode_qr, regenerate_qr};
 use crate::codec::qr_grid::{infer_qr_version, sample_qr_grid};
+use crate::codec::wx_grid::{WxGrid, detect_wx_version, sample_wx, sample_wx_with_badge};
 use crate::detect;
 use crate::detect::finder_qr::{QrFinder, find_qr_finders, select_qr_finder_triplet};
+use crate::detect::finder_wx::{
+    find_wx_finders, select_wx_finders_raw, select_wx_finders_raw_with_badge,
+};
 use crate::image_io;
-use crate::pipeline::perspective::warp_qr_to_square;
+use crate::pipeline::perspective::{
+    WxUprightAnchor, detect_wx_badge_anchor, warp_qr_to_square_image, warp_wx_to_upright_binary,
+    warp_wx_to_upright_image, wx_upright_target_finders,
+};
 use crate::pipeline::preprocess::{BinaryImage, preprocess};
+use crate::screen_capture;
 use crate::ui;
-use crate::vector::diff::{compute_diff, render_qr_diff_preview};
-use crate::vector::svg::qr_matrix_to_svg;
+use crate::vector::diff::{DiffResult, compute_diff, render_qr_diff_preview};
+use crate::vector::svg::{
+    qr_matrix_to_svg, wx_grid_to_diff_preview_image, wx_grid_to_preview_image, wx_grid_to_svg,
+};
 use eframe::egui;
 use image::DynamicImage;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const PREVIEW_SIZE: u32 = 1024;
+const QR_GRID_REFERENCE_SNAP_RATIO: usize = 10;
+const QR_LOGO_IGNORE_RATIO: usize = 3;
+const QR_LOGO_IGNORE_MIN_MODULES: usize = 9;
+const LOADING_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
+const SCREEN_CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(180);
 
 /// 一张加载好的图像 + 上传到 GPU 的纹理句柄。
 ///
@@ -43,10 +63,6 @@ impl LoadedImage {
             name: name.into(),
             color,
         }
-    }
-
-    pub fn from_binary(name: impl Into<String>, bin: &BinaryImage) -> Self {
-        Self::from_dynamic(name, bin.to_dynamic_image())
     }
 
     /// 取出纹理用于显示。第一次调用会上传到 GPU。
@@ -84,6 +100,10 @@ pub struct QRacerApp {
     pub qr_version: Option<u8>,
     /// Stage 3 last regenerated QR matrix.
     pub last_matrix: Option<QrMatrix>,
+    /// QR mask that matches outside the center logo area.
+    pub matched_mask: Option<u8>,
+    /// Stage 5 last sampled mini-program radial grid.
+    pub last_wx_grid: Option<WxGrid>,
     /// Stage 3 last generated SVG payload.
     pub last_svg: Option<String>,
     /// Stage 3 module difference count against the corrected QR image.
@@ -91,12 +111,42 @@ pub struct QRacerApp {
     /// Controls whether red/blue module differences are drawn in the preview.
     pub show_diff_overlay: bool,
     paste_shortcut_was_down: bool,
+    processing_job: Option<ProcessingJob>,
+    capture_job: Option<CaptureJob>,
+    next_job_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskChoice {
     Mask(u8),
     GridFallback,
+}
+
+struct ProcessingJob {
+    receiver: Receiver<ProcessResult>,
+    started_at: Instant,
+}
+
+struct CaptureJob {
+    receiver: Receiver<anyhow::Result<DynamicImage>>,
+    started_at: Instant,
+}
+
+struct ProcessResult {
+    code_kind: CodeKind,
+    status: String,
+    binary: Option<BinaryImage>,
+    finders: Option<Vec<QrFinder>>,
+    warped: Option<BinaryImage>,
+    mask_choice: MaskChoice,
+    last_decoded: Option<QrDecoded>,
+    qr_version: Option<u8>,
+    last_matrix: Option<QrMatrix>,
+    matched_mask: Option<u8>,
+    last_wx_grid: Option<WxGrid>,
+    last_svg: Option<String>,
+    last_diff_count: Option<u32>,
+    preview: Option<(String, DynamicImage)>,
 }
 
 impl QRacerApp {
@@ -115,71 +165,57 @@ impl QRacerApp {
             last_decoded: None,
             qr_version: None,
             last_matrix: None,
+            matched_mask: None,
+            last_wx_grid: None,
             last_svg: None,
             last_diff_count: None,
             show_diff_overlay: true,
             paste_shortcut_was_down: false,
+            processing_job: None,
+            capture_job: None,
+            next_job_id: 0,
         }
     }
 
-    /// 把图像装载为原图 + 占位预览。阶段 2+ 会触发识别管线。
+    /// 把图像装载为原图，并把识别/校正/矢量化放到后台线程。
     pub fn set_original(&mut self, img: DynamicImage) {
-        let binary = preprocess(&img);
-        let code_kind = detect::detect_kind(&binary);
+        self.begin_processing(img, "图像");
+    }
 
-        self.original = Some(LoadedImage::from_dynamic("original", img.clone()));
+    fn begin_processing(&mut self, img: DynamicImage, source_label: &str) {
+        self.next_job_id = self.next_job_id.wrapping_add(1);
+        let job_id = self.next_job_id;
+        let show_diff_overlay = self.show_diff_overlay;
+
+        self.processing_job = None;
+        self.original = Some(LoadedImage::from_dynamic(
+            format!("original-{job_id}"),
+            img.clone(),
+        ));
         self.preview = None;
-        self.code_kind = code_kind;
-        self.binary = Some(binary.clone());
+        self.code_kind = CodeKind::Unknown;
+        self.binary = None;
         self.finders = None;
         self.warped = None;
         self.mask_choice = MaskChoice::Mask(0);
         self.last_decoded = None;
         self.qr_version = None;
         self.last_matrix = None;
+        self.matched_mask = None;
+        self.last_wx_grid = None;
         self.last_svg = None;
         self.last_diff_count = None;
+        self.status = format!("{source_label}已载入，正在识别和校正...");
 
-        if code_kind != CodeKind::Qr {
-            self.status = String::from("图像已加载；未识别到支持的码类型");
-            return;
-        }
-
-        let finders = find_qr_finders(&binary);
-
-        let Some(selected) = select_qr_finder_triplet(&binary, &finders) else {
-            self.status = format!(
-                "已识别 QR，但无法从 {} 个候选中选出三角定位点",
-                finders.len()
-            );
-            self.finders = Some(finders);
-            return;
-        };
-
-        let warped = warp_qr_to_square(&binary, &selected, 512);
-        self.preview = Some(LoadedImage::from_binary("preview", &warped));
-        self.warped = Some(warped.clone());
-        self.finders = Some(finders);
-        self.qr_version = infer_qr_version(&warped).ok();
-
-        match decode_qr(&img, Some(&warped)) {
-            Ok(decoded) => {
-                let mask = decoded.original_mask.unwrap_or(0);
-                self.qr_version = Some(decoded.version);
-                self.mask_choice = MaskChoice::Mask(mask);
-                self.last_decoded = Some(decoded);
-                self.apply_current_mask();
-            }
-            Err(error) => {
-                self.status = if let Some(version) = self.qr_version {
-                    format!(
-                        "已完成 QR 校正并推断版本 V{version}，但解码失败：{error}；可使用网格兜底"
-                    )
-                } else {
-                    format!("已完成 QR 校正，但解码失败：{error}")
-                };
-            }
-        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = process_image(img, job_id, show_diff_overlay);
+            let _ = sender.send(result);
+        });
+        self.processing_job = Some(ProcessingJob {
+            receiver,
+            started_at: Instant::now(),
+        });
     }
 
     pub fn try_paste_from_clipboard(&mut self) {
@@ -197,6 +233,50 @@ impl QRacerApp {
         }
     }
 
+    pub fn try_capture_screen(&mut self, ctx: &egui::Context) {
+        if self.capture_job.is_some() {
+            self.status = String::from("截屏框选已经在进行中");
+            return;
+        }
+
+        self.status = String::from("正在最小化窗口并启动截屏框选...");
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        let (sender, receiver) = mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        thread::spawn(move || {
+            thread::sleep(SCREEN_CAPTURE_HIDE_DELAY);
+            let result = screen_capture::select_screen_region();
+            screen_capture::restore_main_window();
+            let _ = sender.send(result);
+            repaint_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            repaint_ctx.request_repaint();
+        });
+        self.capture_job = Some(CaptureJob {
+            receiver,
+            started_at: Instant::now(),
+        });
+        ctx.request_repaint_after(LOADING_REPAINT_INTERVAL);
+    }
+
+    pub fn loading_message(&self) -> Option<String> {
+        if self.processing_job.is_some() {
+            Some(String::from("正在识别、校正并生成预览..."))
+        } else if self.capture_job.is_some() {
+            Some(String::from("正在进行截屏框选..."))
+        } else {
+            None
+        }
+    }
+
+    fn loading_progress(&self) -> Option<f32> {
+        let started_at = self
+            .processing_job
+            .as_ref()
+            .map(|job| job.started_at)
+            .or_else(|| self.capture_job.as_ref().map(|job| job.started_at))?;
+        Some((started_at.elapsed().as_secs_f32() * 0.35).fract())
+    }
+
     pub fn set_mask(&mut self, mask: u8) {
         self.mask_choice = MaskChoice::Mask(mask.min(7));
         self.apply_current_mask();
@@ -212,55 +292,82 @@ impl QRacerApp {
             return;
         };
 
-        let mut best: Option<(u32, u8, QrMatrix, String)> = None;
-        for mask in 0..=7 {
-            let Ok(matrix) = regenerate_qr(&decoded, mask) else {
-                continue;
-            };
-            let diff = compute_diff(warped, &matrix).diff_count;
-            let svg = qr_matrix_to_svg(&matrix, 1.0);
-            if best
-                .as_ref()
-                .is_none_or(|(best_diff, _, _, _)| diff < *best_diff)
-            {
-                best = Some((diff, mask, matrix, svg));
-            }
-        }
-
-        let Some((_, mask, matrix, svg)) = best else {
-            self.status = String::from("自动选择掩膜失败：无法重生成 QR");
+        let Some(candidate) = choose_matching_qr_mask(&decoded, warped) else {
+            self.matched_mask = None;
+            self.use_grid_fallback();
             return;
         };
 
-        self.mask_choice = MaskChoice::Mask(mask);
-        self.set_generated_artifacts(matrix, svg);
+        self.mask_choice = MaskChoice::Mask(candidate.mask);
+        self.matched_mask = Some(candidate.mask);
+        let svg = qr_matrix_to_svg(&candidate.matrix, 1.0);
+        self.set_generated_artifacts(candidate.matrix, svg);
     }
 
     pub fn use_grid_fallback(&mut self) {
         let Some(warped) = self.warped.as_ref() else {
-            self.status = String::from("还没有可用于网格兜底的校正图");
+            self.status = String::from("还没有可用于网格像素匹配的校正图");
             return;
         };
 
         let version = match self.qr_version.or_else(|| infer_qr_version(warped).ok()) {
             Some(version) => version,
             None => {
-                self.status = String::from("网格兜底失败：无法推断 QR 版本");
+                self.status = String::from("网格像素匹配失败：无法推断 QR 版本");
                 return;
             }
         };
 
         match sample_qr_grid(warped, version) {
             Ok(matrix) => {
+                let matrix = self.stabilize_grid_matrix(matrix);
                 self.qr_version = Some(version);
                 self.mask_choice = MaskChoice::GridFallback;
                 let svg = qr_matrix_to_svg(&matrix, 1.0);
                 self.set_generated_artifacts(matrix, svg);
             }
             Err(error) => {
-                self.status = format!("网格兜底失败：{error}");
+                self.status = format!("网格像素匹配失败：{error}");
             }
         }
+    }
+
+    fn stabilize_grid_matrix(&self, matrix: QrMatrix) -> QrMatrix {
+        let Some(decoded) = self.last_decoded.as_ref() else {
+            return matrix;
+        };
+        if self.matched_mask.is_none() {
+            return matrix;
+        }
+        let mask = decoded.original_mask.unwrap_or(0);
+        let Ok(reference) = regenerate_qr(decoded, mask) else {
+            return matrix;
+        };
+        let Some(diff) = qr_matrix_diff_count(&matrix, &reference) else {
+            return matrix;
+        };
+        let modules = matrix.len().max(1);
+        let max_snap_diff = (modules * modules / QR_GRID_REFERENCE_SNAP_RATIO).max(24);
+        if diff <= max_snap_diff {
+            reference
+        } else {
+            matrix
+        }
+    }
+
+    pub fn resample_wx(&mut self) {
+        if self.code_kind != CodeKind::WxMiniprogram {
+            self.status = String::from("当前图像不是小程序码");
+            return;
+        }
+
+        let Some(binary) = self.binary.clone() else {
+            self.status = String::from("还没有可用于采样的二值图");
+            return;
+        };
+
+        let source = self.original.as_ref().map(|loaded| loaded.source.clone());
+        self.process_wx(&binary, source.as_ref());
     }
 
     pub fn set_show_diff_overlay(&mut self, show: bool) {
@@ -271,6 +378,8 @@ impl QRacerApp {
 
         if self.last_matrix.is_some() {
             self.refresh_generated_preview();
+        } else if self.last_wx_grid.is_some() {
+            self.refresh_wx_preview();
         }
     }
 
@@ -299,6 +408,77 @@ impl QRacerApp {
         }
     }
 
+    fn process_wx(&mut self, binary: &BinaryImage, source: Option<&DynamicImage>) {
+        let finders = find_wx_finders(binary);
+        let badge_anchor = source.and_then(detect_wx_badge_anchor);
+        let raw_selected = badge_anchor
+            .and_then(|badge| select_wx_finders_raw_with_badge(&finders, badge))
+            .or_else(|| select_wx_finders_raw(&finders));
+        let Some(raw_selected) = raw_selected else {
+            self.status = format!(
+                "已识别小程序码，但无法从 {} 个候选中选出三牛眼定位点",
+                finders.len()
+            );
+            return;
+        };
+
+        let correction_size = source
+            .map(|source| source.width().max(source.height()))
+            .unwrap_or_else(|| binary.w.max(binary.h))
+            .clamp(PREVIEW_SIZE, 1600);
+        let anchor = badge_anchor.map(WxUprightAnchor::Badge);
+        let corrected_source = source
+            .map(|source| warp_wx_to_upright_image(source, &raw_selected, anchor, correction_size));
+        let corrected_binary = corrected_source
+            .as_ref()
+            .map(preprocess)
+            .unwrap_or_else(|| {
+                warp_wx_to_upright_binary(binary, &raw_selected, anchor, correction_size)
+            });
+        let selected = wx_upright_target_finders(&raw_selected, correction_size);
+        self.warped = Some(corrected_binary.clone());
+
+        let preferred_version = detect_wx_version(&corrected_binary, &selected).ok();
+        let mut best: Option<(u32, bool, WxGrid)> = None;
+        let mut errors = Vec::new();
+        for version in [36, 54, 72] {
+            let sampled = match corrected_source.as_ref() {
+                Some(source) => sample_wx_with_badge(&corrected_binary, source, &selected, version),
+                None => sample_wx(&corrected_binary, &selected, version),
+            };
+            let grid = match sampled {
+                Ok(grid) => grid,
+                Err(error) => {
+                    errors.push(format!("{version} 线：{error}"));
+                    continue;
+                }
+            };
+            let (_, diff_count) =
+                wx_grid_to_diff_preview_image(&grid, &corrected_binary, false, PREVIEW_SIZE);
+            let preferred = preferred_version == Some(version);
+            if best.as_ref().is_none_or(|(best_diff, best_preferred, _)| {
+                diff_count < *best_diff
+                    || (diff_count == *best_diff && preferred && !*best_preferred)
+            }) {
+                best = Some((diff_count, preferred, grid));
+            }
+        }
+
+        match best {
+            Some((_, _, grid)) => {
+                let svg = wx_grid_to_svg(&grid);
+                self.set_wx_artifacts(grid, svg);
+            }
+            None => {
+                self.status = if errors.is_empty() {
+                    String::from("小程序码径向采样失败：无可用候选")
+                } else {
+                    format!("小程序码径向采样失败：{}", errors.join("；"))
+                };
+            }
+        }
+    }
+
     fn apply_current_mask(&mut self) {
         let MaskChoice::Mask(mask) = self.mask_choice else {
             self.status = String::from("网格兜底将在阶段 4 接入");
@@ -324,9 +504,44 @@ impl QRacerApp {
     }
 
     fn set_generated_artifacts(&mut self, matrix: QrMatrix, svg: String) {
+        self.last_wx_grid = None;
         self.last_matrix = Some(matrix);
         self.last_svg = Some(svg);
         self.refresh_generated_preview();
+    }
+
+    fn set_wx_artifacts(&mut self, grid: WxGrid, svg: String) {
+        self.last_matrix = None;
+        self.matched_mask = None;
+        self.last_wx_grid = Some(grid);
+        self.last_svg = Some(svg);
+        self.refresh_wx_preview();
+    }
+
+    fn refresh_wx_preview(&mut self) {
+        let Some(grid) = self.last_wx_grid.as_ref() else {
+            return;
+        };
+
+        let diff_source = self.warped.as_ref().or(self.binary.as_ref());
+        let (preview, diff_count) = match diff_source {
+            Some(binary) => {
+                wx_grid_to_diff_preview_image(grid, binary, self.show_diff_overlay, PREVIEW_SIZE)
+            }
+            None => (wx_grid_to_preview_image(grid, PREVIEW_SIZE), 0),
+        };
+        self.preview = Some(LoadedImage::from_dynamic(
+            format!(
+                "preview-wx-{}-{}-{}",
+                grid.lines, grid.points_per_line, self.show_diff_overlay
+            ),
+            preview,
+        ));
+        self.last_diff_count = Some(diff_count);
+        self.status = format!(
+            "已识别小程序码：{} 线，每线 {} 点；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+            grid.lines, grid.points_per_line
+        );
     }
 
     fn refresh_generated_preview(&mut self) {
@@ -339,7 +554,7 @@ impl QRacerApp {
             .map(|warped| compute_diff(warped, matrix));
         let diff_count = diff.as_ref().map(|diff| diff.diff_count).unwrap_or(0);
         let modules = matrix.len().max(1) as u32;
-        let scale = (512_u32 / modules).max(2);
+        let scale = (PREVIEW_SIZE / modules).max(2);
         let preview =
             render_qr_diff_preview(matrix, diff.as_ref(), self.show_diff_overlay, scale, 0);
         let preview_name = match self.mask_choice {
@@ -354,23 +569,425 @@ impl QRacerApp {
                 .last_decoded
                 .as_ref()
                 .map(|decoded| {
+                    let mask_text = if self.matched_mask == Some(mask) {
+                        format!("原掩膜 {mask}")
+                    } else if self.matched_mask.is_none() {
+                        format!("当前掩膜 {mask}，无匹配掩膜")
+                    } else {
+                        format!("掩膜 {mask}")
+                    };
                     format!(
-                        "已解码 QR：V{} / ECC {} / 掩膜 {}",
+                        "已解码 QR：V{} / ECC {} / {mask_text}",
                         decoded.version,
-                        decoded.ecc.label(),
-                        mask
+                        decoded.ecc.label()
                     )
                 })
                 .unwrap_or_else(|| format!("QR 掩膜重生成：掩膜 {mask}")),
             MaskChoice::GridFallback => self
                 .qr_version
-                .map(|version| format!("使用网格兜底：V{version}"))
-                .unwrap_or_else(|| String::from("使用网格兜底")),
+                .map(|version| format!("使用网格像素匹配：V{version}"))
+                .unwrap_or_else(|| String::from("使用网格像素匹配")),
         };
         self.status = format!(
             "{mode_text}，差异 {diff_count} 个模块（红色=原图有生成图没有，蓝色=原图没有生成图有）"
         );
     }
+
+    fn poll_background_jobs(&mut self, ctx: &egui::Context) {
+        self.poll_capture_job(ctx);
+        self.poll_processing_job();
+
+        if self.processing_job.is_some() || self.capture_job.is_some() {
+            ctx.request_repaint_after(LOADING_REPAINT_INTERVAL);
+        }
+    }
+
+    fn poll_capture_job(&mut self, ctx: &egui::Context) {
+        let result = match self.capture_job.as_ref() {
+            Some(job) => match job.receiver.try_recv() {
+                Ok(result) => Some(Ok(result)),
+                Err(TryRecvError::Disconnected) => Some(Err(String::from("截屏线程已退出"))),
+                Err(TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+        self.capture_job = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+
+        match result {
+            Ok(Ok(img)) => self.begin_processing(img, "截屏图片"),
+            Ok(Err(error)) => self.status = format!("截屏取消或失败：{error}"),
+            Err(error) => self.status = format!("截屏失败：{error}"),
+        }
+    }
+
+    fn poll_processing_job(&mut self) {
+        let result = match self.processing_job.as_ref() {
+            Some(job) => match job.receiver.try_recv() {
+                Ok(result) => Some(Ok(result)),
+                Err(TryRecvError::Disconnected) => Some(Err(String::from("处理线程已退出"))),
+                Err(TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+        self.processing_job = None;
+
+        match result {
+            Ok(result) => self.apply_process_result(result),
+            Err(error) => self.status = format!("处理失败：{error}"),
+        }
+    }
+
+    fn apply_process_result(&mut self, result: ProcessResult) {
+        self.code_kind = result.code_kind;
+        self.binary = result.binary;
+        self.finders = result.finders;
+        self.warped = result.warped;
+        self.mask_choice = result.mask_choice;
+        self.last_decoded = result.last_decoded;
+        self.qr_version = result.qr_version;
+        self.last_matrix = result.last_matrix;
+        self.matched_mask = result.matched_mask;
+        self.last_wx_grid = result.last_wx_grid;
+        self.last_svg = result.last_svg;
+        self.last_diff_count = result.last_diff_count;
+        self.preview = result
+            .preview
+            .map(|(name, image)| LoadedImage::from_dynamic(name, image));
+        self.status = result.status;
+    }
+}
+
+fn process_image(img: DynamicImage, job_id: u64, show_diff_overlay: bool) -> ProcessResult {
+    let binary = preprocess(&img);
+    let code_kind = detect::detect_kind(&binary);
+    let mut result = ProcessResult {
+        code_kind,
+        status: String::from("图像已加载；未识别到支持的码类型"),
+        binary: Some(binary.clone()),
+        finders: None,
+        warped: None,
+        mask_choice: MaskChoice::Mask(0),
+        last_decoded: None,
+        qr_version: None,
+        last_matrix: None,
+        matched_mask: None,
+        last_wx_grid: None,
+        last_svg: None,
+        last_diff_count: None,
+        preview: None,
+    };
+
+    match code_kind {
+        CodeKind::Qr => process_qr_image(&img, &binary, job_id, show_diff_overlay, &mut result),
+        CodeKind::WxMiniprogram => {
+            process_wx_image(&img, &binary, job_id, show_diff_overlay, &mut result)
+        }
+        _ => {}
+    }
+
+    result
+}
+
+fn process_qr_image(
+    img: &DynamicImage,
+    binary: &BinaryImage,
+    job_id: u64,
+    show_diff_overlay: bool,
+    result: &mut ProcessResult,
+) {
+    let finders = find_qr_finders(binary);
+
+    let Some(selected) = select_qr_finder_triplet(binary, &finders) else {
+        result.status = format!(
+            "已识别 QR，但无法从 {} 个候选中选出三角定位点",
+            finders.len()
+        );
+        result.finders = Some(finders);
+        return;
+    };
+
+    let corrected_source = warp_qr_to_square_image(img, binary, &selected, PREVIEW_SIZE);
+    let warped = preprocess(&corrected_source);
+    result.preview = Some((
+        format!("preview-qr-corrected-{job_id}"),
+        warped.to_dynamic_image(),
+    ));
+    result.warped = Some(warped.clone());
+    result.finders = Some(finders);
+    result.qr_version = infer_qr_version(&warped).ok();
+
+    match decode_qr(img, Some(&warped)) {
+        Ok(decoded) => {
+            result.qr_version = Some(decoded.version);
+            result.last_decoded = Some(decoded.clone());
+
+            if let Some(candidate) = choose_matching_qr_mask(&decoded, &warped) {
+                let mask = candidate.mask;
+                result.mask_choice = MaskChoice::Mask(mask);
+                result.matched_mask = Some(mask);
+                let svg = qr_matrix_to_svg(&candidate.matrix, 1.0);
+                let (preview_name, preview, diff_count) = qr_preview_for_matrix(
+                    &candidate.matrix,
+                    Some(&warped),
+                    result.mask_choice,
+                    show_diff_overlay,
+                    job_id,
+                );
+                result.last_matrix = Some(candidate.matrix);
+                result.last_svg = Some(svg);
+                result.last_diff_count = Some(diff_count);
+                result.preview = Some((preview_name, preview));
+                result.status = qr_mask_status_text(&decoded, mask, Some(mask), diff_count, 0);
+            } else {
+                result.matched_mask = None;
+                result.mask_choice = MaskChoice::GridFallback;
+                match sample_qr_grid(&warped, decoded.version) {
+                    Ok(matrix) => {
+                        let svg = qr_matrix_to_svg(&matrix, 1.0);
+                        let (preview_name, preview, diff_count) = qr_preview_for_matrix(
+                            &matrix,
+                            Some(&warped),
+                            result.mask_choice,
+                            show_diff_overlay,
+                            job_id,
+                        );
+                        result.last_matrix = Some(matrix);
+                        result.last_svg = Some(svg);
+                        result.last_diff_count = Some(diff_count);
+                        result.preview = Some((preview_name, preview));
+                        result.status = format!(
+                            "已解码 QR：V{} / ECC {} / 无匹配掩膜，已自动使用网格像素匹配，差异 {diff_count} 个模块（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+                            decoded.version,
+                            decoded.ecc.label(),
+                        );
+                    }
+                    Err(error) => {
+                        result.status =
+                            format!("已解码 QR，但 8 种掩膜均不匹配，且网格像素匹配失败：{error}");
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            result.status = if let Some(version) = result.qr_version {
+                format!("已完成 QR 校正并推断版本 V{version}，但解码失败：{error}；可使用网格兜底")
+            } else {
+                format!("已完成 QR 校正，但解码失败：{error}")
+            };
+        }
+    }
+}
+
+fn process_wx_image(
+    img: &DynamicImage,
+    binary: &BinaryImage,
+    job_id: u64,
+    show_diff_overlay: bool,
+    result: &mut ProcessResult,
+) {
+    let finders = find_wx_finders(binary);
+    let badge_anchor = detect_wx_badge_anchor(img);
+    let raw_selected = badge_anchor
+        .and_then(|badge| select_wx_finders_raw_with_badge(&finders, badge))
+        .or_else(|| select_wx_finders_raw(&finders));
+    let Some(raw_selected) = raw_selected else {
+        result.status = format!(
+            "已识别小程序码，但无法从 {} 个候选中选出三牛眼定位点",
+            finders.len()
+        );
+        return;
+    };
+
+    let correction_size = img.width().max(img.height()).clamp(PREVIEW_SIZE, 1600);
+    let anchor = badge_anchor.map(WxUprightAnchor::Badge);
+    let corrected_source = warp_wx_to_upright_image(img, &raw_selected, anchor, correction_size);
+    let corrected_binary = preprocess(&corrected_source);
+    let selected = wx_upright_target_finders(&raw_selected, correction_size);
+    result.warped = Some(corrected_binary.clone());
+
+    let preferred_version = detect_wx_version(&corrected_binary, &selected).ok();
+    let mut best: Option<(u32, bool, WxGrid)> = None;
+    let mut errors = Vec::new();
+    for version in [36, 54, 72] {
+        let grid =
+            match sample_wx_with_badge(&corrected_binary, &corrected_source, &selected, version) {
+                Ok(grid) => grid,
+                Err(error) => {
+                    errors.push(format!("{version} 线：{error}"));
+                    continue;
+                }
+            };
+        let (_, diff_count) =
+            wx_grid_to_diff_preview_image(&grid, &corrected_binary, false, PREVIEW_SIZE);
+        let preferred = preferred_version == Some(version);
+        if best.as_ref().is_none_or(|(best_diff, best_preferred, _)| {
+            diff_count < *best_diff || (diff_count == *best_diff && preferred && !*best_preferred)
+        }) {
+            best = Some((diff_count, preferred, grid));
+        }
+    }
+
+    match best {
+        Some((_, _, grid)) => {
+            let svg = wx_grid_to_svg(&grid);
+            let (preview, diff_count) = wx_grid_to_diff_preview_image(
+                &grid,
+                &corrected_binary,
+                show_diff_overlay,
+                PREVIEW_SIZE,
+            );
+            result.last_wx_grid = Some(grid.clone());
+            result.last_svg = Some(svg);
+            result.last_diff_count = Some(diff_count);
+            result.preview = Some((format!("preview-wx-{}-{job_id}", grid.lines), preview));
+            result.status = format!(
+                "已识别小程序码：{} 线，每线 {} 点；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+                grid.lines, grid.points_per_line
+            );
+        }
+        None => {
+            result.status = if errors.is_empty() {
+                String::from("小程序码径向采样失败：无可用候选")
+            } else {
+                format!("小程序码径向采样失败：{}", errors.join("；"))
+            };
+        }
+    }
+}
+
+struct QrMaskCandidate {
+    mask: u8,
+    matrix: QrMatrix,
+    total_diff: u32,
+    outside_logo_diff: u32,
+}
+
+fn choose_matching_qr_mask(decoded: &QrDecoded, warped: &BinaryImage) -> Option<QrMaskCandidate> {
+    let preferred = decoded.original_mask;
+    let mut candidates = qr_mask_candidates(decoded, warped);
+    let index = best_matching_qr_mask_index(&candidates, preferred)?;
+    Some(candidates.swap_remove(index))
+}
+
+fn best_matching_qr_mask_index(
+    candidates: &[QrMaskCandidate],
+    preferred: Option<u8>,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.outside_logo_diff == 0)
+        .min_by_key(|(_, candidate)| {
+            (
+                preferred != Some(candidate.mask),
+                candidate.total_diff,
+                candidate.mask,
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+fn qr_mask_candidates(decoded: &QrDecoded, warped: &BinaryImage) -> Vec<QrMaskCandidate> {
+    (0..=7)
+        .filter_map(|mask| {
+            let matrix = regenerate_qr(decoded, mask).ok()?;
+            let diff = compute_diff(warped, &matrix);
+            let modules = matrix.len();
+            Some(QrMaskCandidate {
+                mask,
+                matrix,
+                total_diff: diff.diff_count,
+                outside_logo_diff: qr_diff_outside_center_logo(&diff, modules),
+            })
+        })
+        .collect()
+}
+
+fn qr_diff_outside_center_logo(diff: &DiffResult, modules: usize) -> u32 {
+    let modules = modules.max(1);
+    diff.diff_modules
+        .iter()
+        .filter(|&&(x, y)| !is_qr_center_logo_module(modules, x as usize, y as usize))
+        .count() as u32
+}
+
+fn is_qr_center_logo_module(modules: usize, x: usize, y: usize) -> bool {
+    if modules == 0 {
+        return false;
+    }
+    let side = (modules / QR_LOGO_IGNORE_RATIO)
+        .max(QR_LOGO_IGNORE_MIN_MODULES)
+        .min(modules);
+    let start = (modules - side) / 2;
+    let end = start + side;
+    x >= start && x < end && y >= start && y < end
+}
+
+fn qr_mask_status_text(
+    decoded: &QrDecoded,
+    mask: u8,
+    matched_mask: Option<u8>,
+    diff_count: u32,
+    outside_logo_diff: u32,
+) -> String {
+    let mask_text = if matched_mask == Some(mask) {
+        format!("原掩膜 {mask}")
+    } else {
+        format!("当前掩膜 {mask}，无匹配掩膜（中心外差异 {outside_logo_diff}）")
+    };
+    format!(
+        "已解码 QR：V{} / ECC {} / {}，差异 {diff_count} 个模块（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+        decoded.version,
+        decoded.ecc.label(),
+        mask_text
+    )
+}
+
+fn qr_preview_for_matrix(
+    matrix: &QrMatrix,
+    warped: Option<&BinaryImage>,
+    mask_choice: MaskChoice,
+    show_diff_overlay: bool,
+    job_id: u64,
+) -> (String, DynamicImage, u32) {
+    let diff = warped.map(|warped| compute_diff(warped, matrix));
+    let diff_count = diff.as_ref().map(|diff| diff.diff_count).unwrap_or(0);
+    let modules = matrix.len().max(1) as u32;
+    let scale = (PREVIEW_SIZE / modules).max(2);
+    let preview = render_qr_diff_preview(matrix, diff.as_ref(), show_diff_overlay, scale, 0);
+    let name = match mask_choice {
+        MaskChoice::Mask(mask) => format!("preview-mask-{mask}-{job_id}"),
+        MaskChoice::GridFallback => format!("preview-grid-fallback-{job_id}"),
+    };
+    (name, preview, diff_count)
+}
+
+fn qr_matrix_diff_count(lhs: &QrMatrix, rhs: &QrMatrix) -> Option<usize> {
+    if lhs.len() != rhs.len() || lhs.iter().zip(rhs).any(|(l, r)| l.len() != r.len()) {
+        return None;
+    }
+
+    Some(
+        lhs.iter()
+            .zip(rhs)
+            .map(|(lhs_row, rhs_row)| {
+                lhs_row
+                    .iter()
+                    .zip(rhs_row)
+                    .filter(|(lhs, rhs)| lhs != rhs)
+                    .count()
+            })
+            .sum(),
+    )
 }
 
 fn install_cjk_font(ctx: &egui::Context) {
@@ -461,8 +1078,39 @@ fn platform_paste_shortcut_down(_ctx: &egui::Context) -> bool {
     false
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qr_mask_matching_ignores_center_logo_region() {
+        let diff = DiffResult {
+            diff_modules: vec![(10, 10), (11, 10), (10, 11)],
+            missing_in_generated: Vec::new(),
+            extra_in_generated: Vec::new(),
+            diff_count: 3,
+        };
+
+        assert_eq!(qr_diff_outside_center_logo(&diff, 29), 0);
+    }
+
+    #[test]
+    fn qr_mask_matching_rejects_non_center_differences() {
+        let diff = DiffResult {
+            diff_modules: vec![(10, 10), (2, 18)],
+            missing_in_generated: Vec::new(),
+            extra_in_generated: Vec::new(),
+            diff_count: 2,
+        };
+
+        assert_eq!(qr_diff_outside_center_logo(&diff, 29), 1);
+    }
+}
+
 impl eframe::App for QRacerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_background_jobs(ctx);
+
         // 全局快捷键：Ctrl+V 粘贴
         let shortcut_is_down = paste_shortcut_down(ctx);
         let paste_pressed = shortcut_is_down && !self.paste_shortcut_was_down;
@@ -476,12 +1124,20 @@ impl eframe::App for QRacerApp {
 
         // 顶部工具栏
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui_| {
-            ui::toolbar::show(ui_, self);
+            ui::toolbar::show(ui_, self, ctx);
         });
 
         // 底部状态栏
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui_| {
             ui_.horizontal(|ui_| {
+                if let Some(progress) = self.loading_progress() {
+                    ui_.spinner();
+                    ui_.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(160.0)
+                            .text("处理中"),
+                    );
+                }
                 ui_.label(format!("状态：{}", self.status));
             });
         });
@@ -489,6 +1145,7 @@ impl eframe::App for QRacerApp {
         // 中央：左右对比预览
         egui::CentralPanel::default().show(ctx, |ui_| {
             ui::mask_panel::show(ui_, self);
+            ui::wx_panel::show(ui_, self);
             ui_.separator();
             ui::compare_view::show(ui_, self, ctx);
         });

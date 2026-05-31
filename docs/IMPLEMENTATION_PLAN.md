@@ -1,7 +1,7 @@
 # QRacer 分步实施计划
 
 > 文档版本：v1.0  
-> 最后更新：2026-05-29  
+> 最后更新：2026-05-31  
 > 适用对象：AI 开发者（自主执行）+ 人类审阅者
 
 本文档把 [ARCHITECTURE.md](./ARCHITECTURE.md) 的路线图拆解为可单独 PR / 单独执行的任务。**每个任务包含：依赖、目标、详细步骤、文件清单、验收标准**。AI 开发者可以按顺序读、直接照做。
@@ -29,9 +29,12 @@
 - `src/app.rs`：`QRacerApp` 状态 + immediate-mode `update()`
 - `src/code_kind.rs`：`CodeKind` 枚举
 - `src/image_io.rs`：剪贴板读图、文件对话框、纹理转换
+- `src/screen_capture.rs`：Windows 全屏透明遮罩框选 + GDI 截屏导入
 - `src/ui/{toolbar, compare_view}.rs`：工具栏 + 左右对比
+- 导入体验优化（2026-05-31）：粘贴、打开或截屏得到图片后先显示原图；预处理、识别、校正、解码/采样、SVG 和预览生成在后台线程执行，状态栏和预览区显示 loading
+- 工具栏新增"截屏"按钮：点击后隐藏本应用窗口，显示全屏透明遮罩；拖拽框选后自动把截图区域导入并开始后台处理，Esc/右键取消
 
-**验收已通过**：`cargo build` 无 warning；窗口启动正常；粘贴/打开能加载图像。
+**验收已通过**：`cargo build` 无 warning；窗口启动正常；粘贴/打开能加载图像；导入后原图先显示且处理期间有 loading 状态。
 
 ---
 
@@ -46,6 +49,8 @@
 - 已修正 finder 选点策略：不再按 `module` 最大直接取前三个候选，而是按模块尺寸一致性、右角几何和三角面积选择真正的三个 QR 角点，避免数据区误检导致透视校正歪斜
 - 已修正旋转场景：三点选择加入 finder 间 timing pattern 黑白交替评分，并收紧近似直角误差阈值，避免顺/逆时针旋转二维码中数据区误检抢占真实 finder
 - 已修正轻微透视场景：V2+ QR 优先搜索右下 alignment pattern 作为第 4 个透视约束点；未检测到 alignment pattern 时再回退三 finder 仿射估计
+- QR 拍照样本优化（2026-05-31）：三点选择增加 7×7 finder 模板评分，避免拍照图中数据区伪 finder 抢占真实角点；V2+ 透视校正改为用三个 finder 中心 + 右下 alignment 中心直接求单应矩阵，再反推外框四角
+- QR 校正也改为先 warp 原彩色图，再对校正图重新二值化，减少拍照图先二值化再拉伸产生的锯齿和边缘断裂
 - 已接入 `QRacerApp::set_original()`：粘贴/打开图片后自动运行预处理、识别、finder 检测和透视校正；非 QR 图片右侧预览为空
 - 已修复 UI 中文显示：启动时加载 Windows 系统 CJK 字体注册到 egui，避免默认字体缺字导致中文乱码
 - 已修复图片剪贴板快捷键：egui-winit 在图片剪贴板场景会吞掉 `Ctrl+V` 的 `Key::V` 事件且不产生文本 `Paste` 事件，现额外用 Windows 前台按键状态做边沿触发，应用在前台时可直接 `Ctrl+V` 粘贴图片
@@ -58,8 +63,8 @@
 - `cargo clippy --no-deps -- -D warnings`
 
 **仍需人工/样本验收**：
-- 当前仓库没有 `assets/samples/` 真实截图样本；阶段 2 自动化验证使用 `qrcodegen` 合成 QR 样本
-- 真实拍歪 QR 截图、小程序码/抖音码截图的 UI 手测需要在样本补齐后执行
+- 根目录 `标准.jpg`、`拍照1.jpg`、`拍照2.jpg`、`拍照3.jpg` 已纳入 QR 拍照回归；同一组样本的解码重生成和网格像素匹配输出需与标准图一致
+- 小程序码/抖音码截图的 UI 手测需要按码类型继续补样本执行
 
 ### 任务 2.1：新增依赖 + 公共错误类型
 
@@ -91,7 +96,7 @@
        #[error("图像格式错误：{0}")]
        ImageFormat(String),
    }
-
+   
    pub type Result<T> = std::result::Result<T, QRacerError>;
    ```
 3. 在 `src/main.rs` 顶部加 `mod error;`
@@ -122,10 +127,10 @@
        pub h: u32,
        pub data: Vec<u8>, // 0 或 255，存 u8 兼容 imageproc::GrayImage
    }
-
+   
    /// 主入口：灰度 → Otsu 阈值 → 形态学开运算去噪
    pub fn preprocess(img: &DynamicImage) -> BinaryImage;
-
+   
    /// 仅做 Otsu 二值化（不去噪）
    pub fn otsu_binarize(gray: &image::GrayImage) -> image::GrayImage;
    ```
@@ -168,10 +173,10 @@ fn preprocess_keeps_qr_modules() {
    pub mod finder_qr;
    pub mod finder_wx;  // 阶段 5 实现
    pub mod finder_dy;  // 阶段 6 实现
-
+   
    use crate::code_kind::CodeKind;
    use crate::pipeline::preprocess::BinaryImage;
-
+   
    pub fn detect_kind(bin: &BinaryImage) -> CodeKind;
    ```
 2. 新建 `src/detect/finder_qr.rs`，定义：
@@ -182,7 +187,7 @@ fn preprocess_keeps_qr_modules() {
        pub cy: f64,
        pub module: f64,  // 单模块边长（亚像素）
    }
-
+   
    pub fn find_qr_finders(bin: &BinaryImage) -> Vec<QrFinder>;
    ```
 3. **算法**（行扫描 RLE 法）：
@@ -255,13 +260,13 @@ fn ignores_finders_in_data_area() {
    use nalgebra::Matrix3;
    use crate::detect::finder_qr::QrFinder;
    use crate::pipeline::preprocess::BinaryImage;
-
+   
    pub fn warp_qr_to_square(
        bin: &BinaryImage,
        finders: &[QrFinder; 3],
        target_size: u32,
    ) -> BinaryImage;
-
+   
    /// 从四对点求单应矩阵（DLT 法）
    pub fn homography_from_4pts(
        src: &[(f64, f64); 4],
@@ -332,8 +337,9 @@ fn warp_synthetic_qr_recovers_modules() {
 - 已实现 `regenerate_qr()`：按解码文本、版本、纠错等级和指定 mask 0-7 调用 `qrcodegen::encode_segments_advanced()` 重生成模块矩阵
 - 已新增 `src/vector/{mod,svg,diff,shapes}.rs`：输出 QR SVG；按校正图模块中心多数投票计算差异；右侧预览中用红色标记"原图有、生成图没有"，用蓝色标记"原图没有、生成图有"
 - 已新增 `src/ui/mask_panel.rs` 并接入 `QRacerApp`：支持 0-7 掩膜单选、自动选择差异最少掩膜、显示/隐藏差异开关、显示版本/ECC/原始掩膜/差异模块数
+- 原掩膜显示优化（2026-05-31）：format info 读到的 mask 仅作为候选；8 种掩膜中必须有一个在中心 Logo 区外差异为 0 才显示"原掩膜 x"。中心 Logo 区内差异忽略，中心外存在任意差异则显示"无匹配掩膜"，并自动使用网格像素匹配采样
 - 已启用工具栏"导出 SVG"按钮：生成成功后可保存 `.svg` 文件；"复制矢量"仍留到阶段 6 的 EMF 剪贴板实现
-- "网格兜底"按钮已作为阶段 4 占位接入，当前不执行采样兜底
+- "网格像素匹配"按钮已接入阶段 4 采样兜底流程
 
 **验证已通过**：
 - `cargo fmt --check`
@@ -373,16 +379,16 @@ qrcodegen = "1.8"
 2. 新建 `src/codec/qr.rs`：
    ```rust
    use rxing::{BarcodeFormat, DecodeHints, MultiFormatReader, Reader};
-
+   
    pub struct QrDecoded {
        pub text: String,
        pub version: u8,        // 1-40
        pub ecc: QrEcc,         // L/M/Q/H
        pub original_mask: Option<u8>, // rxing 不一定能给到，可能需要从 format info 自己解
    }
-
+   
    pub enum QrEcc { L, M, Q, H }
-
+   
    pub fn decode_qr(img: &image::DynamicImage) -> crate::error::Result<QrDecoded>;
    ```
 3. 用 `rxing::helpers::detect_in_luma` 或 `MultiFormatReader::decode` 解码
@@ -420,7 +426,7 @@ fn decode_synthetic_qr() {
 2. 实现：
    ```rust
    use qrcodegen::{QrCode, QrCodeEcc, QrSegment, Version, Mask};
-
+   
    let ecc = match decoded.ecc {
        QrEcc::L => QrCodeEcc::Low,
        QrEcc::M => QrCodeEcc::Medium,
@@ -474,7 +480,7 @@ fn regenerate_with_mask_3_matches_canonical_mask_3() {
        h: f64,
        body: String,
    }
-
+   
    impl SvgBuilder {
        pub fn new(w: f64, h: f64) -> Self;
        pub fn rect(&mut self, x: f64, y: f64, w: f64, h: f64, fill: &str);
@@ -482,7 +488,7 @@ fn regenerate_with_mask_3_matches_canonical_mask_3() {
        pub fn path(&mut self, d: &str, fill: &str);
        pub fn finish(self) -> String; // <svg ...>{body}</svg>
    }
-
+   
    pub fn qr_matrix_to_svg(matrix: &[Vec<bool>], module_mm: f64) -> String;
    ```
 3. `qr_matrix_to_svg`：每个 `true` 模块画一个 `<rect>`，边长 = `module_mm`
@@ -515,7 +521,7 @@ fn svg_module_count_matches() {
        pub diff_modules: Vec<(u32, u32)>, // 不一致模块的 (i,j)
        pub overlay: egui::ColorImage,     // 同原图尺寸，差异处红色半透明
    }
-
+   
    pub fn compute_diff(
        warped_original: &BinaryImage,
        generated_matrix: &[Vec<bool>],
@@ -537,7 +543,7 @@ fn svg_module_count_matches() {
 
 ### 任务 3.6：掩膜面板 + 自动 8 掩膜对比
 
-**目标**：UI 上添加 0-7 掩膜单选 + "网格兜底"按钮，以及"自动尝试所有掩膜"按钮。
+**目标**：UI 上添加 0-7 掩膜单选 + "网格像素匹配"按钮，以及"自动尝试所有掩膜"按钮。
 
 **步骤**：
 1. 新建 `src/ui/mask_panel.rs`：
@@ -545,7 +551,7 @@ fn svg_module_count_matches() {
    pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp);
    ```
    - 8 个掩膜单选（RadioButton）
-   - "网格兜底"按钮（阶段 4 接入）
+   - "网格像素匹配"按钮（阶段 4 接入）
    - "自动选最佳掩膜"按钮（自动跑 8 种，取差异最少的）
    - 显示当前差异模块数
 2. 在 `QRacerApp` 增加：
@@ -553,7 +559,7 @@ fn svg_module_count_matches() {
    pub mask_choice: MaskChoice,
    pub last_decoded: Option<QrDecoded>,
    pub last_diff_count: Option<u32>,
-
+   
    pub enum MaskChoice {
        Mask(u8),
        GridFallback,
@@ -592,13 +598,15 @@ fn svg_module_count_matches() {
 
 ---
 
-## 阶段 4：QR 网格兜底（已完成）
+## 阶段 4：QR 网格像素匹配（已完成）
 
 **完成记录（2026-05-29）**：
 - 已新增 `src/codec/qr_grid.rs`：通过阶段 3 的 QR 版本推断能力识别模块数，并在校正图上按模块中心 3×3 多数投票采样生成 `QrMatrix`
-- 已接通 `MaskChoice::GridFallback`：点击"网格兜底"后不再走 `qrcodegen` 重生成，而是直接采样校正图生成 SVG 和右侧预览
-- 已支持"解码失败但版本可推断"场景：阶段 2 校正成功后，即使 QR payload 解码失败，UI 仍显示"网格兜底"入口
-- 掩膜单选和"自动选最佳"在未解码时禁用；"网格兜底"只依赖校正图和版本推断
+- 已接通 `MaskChoice::GridFallback`：点击"网格像素匹配"后不再走 `qrcodegen` 重生成，而是直接采样校正图生成 SVG 和右侧预览
+- 已支持"解码失败但版本可推断"场景：阶段 2 校正成功后，即使 QR payload 解码失败，UI 仍显示"网格像素匹配"入口
+- QR 拍照样本优化（2026-05-31）：当 QR 已能解码时，网格像素匹配会用原始 mask 的解码重生成矩阵作为稳定参考；若直接采样矩阵与参考差异在 10% 模块以内，则输出参考矩阵，避免中心 Logo、屏幕纹理和拍照透视造成同一码不同图；解码失败时仍保留纯网格兜底
+- 根目录 `标准.jpg`、`拍照1.jpg`、`拍照2.jpg`、`拍照3.jpg` 已纳入 QR 回归：解码再重建矩阵逐位一致，网格像素匹配输出也逐位一致
+- 掩膜单选和"自动选最佳"在未解码时禁用；"网格像素匹配"只依赖校正图和版本推断；当已解码 QR 无匹配掩膜时也会自动走网格像素匹配，且不再用解码重生成矩阵替换采样矩阵
 
 **验证已通过**：
 - `cargo fmt --check`
@@ -607,7 +615,7 @@ fn svg_module_count_matches() {
 - `cargo clippy --no-deps -- -D warnings`
 
 **仍需人工/样本验收**：
-- 当前仍缺少真实损坏 QR 截图 fixture；自动化验证使用 `qrcodegen` 合成无噪 QR 并确认采样矩阵 1:1 等于原矩阵
+- 当前仍缺少真实损坏 QR 截图 fixture；自动化验证已覆盖合成无噪 QR 和根目录拍照 QR，但无法解码的真实损坏 QR 仍需补样本
 - 标准 `cargo build` 若被正在运行的 `target\debug\qracer.exe` 占用，会在最终验证时改用独立 target 目录确认构建
 
 ### 任务 4.1：网格采样实现
@@ -642,19 +650,51 @@ fn grid_sampling_recovers_perfect_qr() {
 
 ---
 
-### 任务 4.2：UI 接通网格兜底
+### 任务 4.2：UI 接通网格像素匹配
 
 **步骤**：
 1. `MaskChoice::GridFallback` 分支：调用 `sample_qr_grid` 而非 `regenerate_qr`
-2. 显示状态："使用网格兜底（保证 1:1 还原）"
+2. 显示状态："使用网格像素匹配（保证 1:1 还原）"
 
 **验收**：
-- [ ] 点"网格兜底"按钮，preview 侧应与原图模块完全一致（差异 = 0）
-- [ ] 用一张"无解码可能"的损坏 QR（手动把数据区涂掉几个模块），网格兜底仍能输出原样矢量
+- [ ] 点"网格像素匹配"按钮，preview 侧应与原图模块完全一致（差异 = 0）
+- [ ] 用一张"无解码可能"的损坏 QR（手动把数据区涂掉几个模块），网格像素匹配仍能输出原样矢量
 
 ---
 
-## 阶段 5：小程序码识别与采样
+## 阶段 5：小程序码识别与采样（已完成）
+
+**完成记录（2026-05-29）**：
+- 已实现 `src/detect/finder_wx.rs`：通过黑色连通域、圆度近似和同心嵌套关系检测小程序码三牛眼定位点，并在 `detect_kind()` 中接入 `CodeKind::WxMiniprogram`
+- 已新增 `src/codec/wx_grid.rs`：根据三牛眼推算极坐标几何，按 36/54/72 线版本进行径向采样，每线固定 13 点
+- 已新增 `vector::shapes::polar_sector_path()`，并在 `src/vector/svg.rs` 中支持小程序码圆角矩形/圆点 SVG 输出和右侧预览光栅化
+- 已接入 `QRacerApp`：粘贴/打开小程序码后自动识别、采样、生成 SVG；小程序码掩膜面板隐藏，显示“重新采样”和“显示差异”入口，工具栏“导出 SVG”复用既有流程
+
+**调参记录（2026-05-30）**：
+- 已用 `samples/` 下 9 张标准小程序码调参：三牛眼检测增加标准左上/右上/左下象限模板匹配兜底，并按等腰直角三角形约束选择定位点
+- 径向采样内半径改为从中心 Logo 外侧开始，外半径按标准样本调到 `牛眼中心半径 + 1.41 * 牛眼外半径`；角向采样增加相位搜索，36/54/72 推断改为优先选择重建误差最低的候选
+- SVG/预览从扇形块改为小程序码实际形态的填充圆角矩形/圆点，并补绘三牛眼定位点
+- 采样时把三牛眼和右下小程序徽标覆盖区作为保留区，不再生成原图没有的黑色码点；右下徽标从原图按形状检测并矢量绘制，颜色可为绿色或灰度
+- 已参考 `标准小程序码.svg` 校准黑色码点粗细：圆角矩形宽度约等于一个径向采样步长；右下徽标的白色 S 使用标准 SVG 的 S 子路径缩放生成
+- 已增加小程序码像素级差异预览：红色表示原图有、生成图没有，蓝色表示原图没有、生成图有；UI 中可用“显示差异”开关控制
+- `samples/` 回归增加 `小程序码9.png` 识别为 72 线断言，并限制标准样本生成预览的像素差异上限
+- 已修正 `小程序码9.png` 三牛眼微小检测偏差：选中三牛眼后按近似正交轴归一化，让右上/左下牛眼与左上牛眼严格共线，同时保留实际横向/纵向距离
+- 校正预览光栅尺寸从 512 提升到 1024；左右对比图在面板剩余空间内居中显示；右下小程序徽标的 S 预览改为平滑曲线绘制，导出 SVG 仍使用标准路径
+- 已接入小程序码校正前置步骤：先用原图三牛眼和右下徽标作为锚点把旋转/轻微透视/扭曲图拉正到标准正向画布，再在校正图上采样、预览和导出 SVG；中心 Logo 不参与校正，因为 Logo 形状和颜色不可作为稳定标准
+- 非标准样本优化（2026-05-31）：三牛眼选点增加“牛眼外径 / 三角边长”比例约束，避免扭曲图中大码点连通域被误选为定位点；小程序码校正改为先 warp 原彩色图，再对校正图重新二值化采样
+- 右下徽标检测从绿色阈值改为形状检测：提取非白、非黑的大圆形/椭圆形连通域，支持标准灰度图和非绿色徽标；照片样本会额外排除黑色码点和浅灰背景，连通域失败时在右下区域做圆盘模板扫描兜底；三牛眼选择在检测到徽标时增加“推算右下角接近徽标”的几何评分，用径向网格的标准分布判断修复方向
+- 根目录 `标准.jpg`、`拍照1.jpg`、`拍照2.jpg`、`拍照3.jpg` 已纳入回归：拍照图先校正再采样，并与 `标准.jpg` 的采样矩阵逐位对比，当前要求差异 = 0
+
+**验证已通过**：
+- `cargo fmt --check`
+- `cargo test`（32 个单元测试通过，包含 `samples/` 标准小程序码和根目录 6 张标准/灰度/变换样本回归）
+- `cargo build`
+- `cargo clippy --no-deps -- -D warnings`
+
+**仍需人工/样本验收**：
+- 当前已覆盖标准正向、非圆形中心 Logo、真实拍照透视、浅灰背景和屏幕纹理样本；遮挡、严重模糊和更低清晰度截图仍需继续补样本验证
+- 小程序码 payload 属于私有编码，本阶段只做几何识别、采样和矢量化，不做逆向解码
+- 当前小程序码差异高亮为右侧预览的像素级 overlay；原图坐标系的半透明反投影叠加仍可作为后续增强
 
 ### 任务 5.1：小程序码 Finder（三牛眼）
 
@@ -668,7 +708,7 @@ fn grid_sampling_recovers_perfect_qr() {
        pub cy: f64,
        pub r_outer: f64,  // 外圆半径
    }
-
+   
    pub fn find_wx_finders(bin: &BinaryImage) -> Vec<WxFinder>;
    ```
 2. 算法（**纯 Rust，不依赖 Hough Circle**）：
@@ -729,7 +769,7 @@ fn grid_sampling_recovers_perfect_qr() {
        pub points_per_line: u32, // 固定 13
        pub samples: Vec<bool>,
    }
-
+   
    pub fn sample_wx(
        bin: &BinaryImage,
        finders: &[WxFinder; 3],
@@ -776,10 +816,11 @@ fn grid_sampling_recovers_perfect_qr() {
 ### 任务 5.5：小程序码差异高亮 + UI
 
 **步骤**：
-1. `compute_diff_wx`：同 QR 差异，但比较的是极坐标采样
-2. UI 中识别到 `CodeKind::WxMiniprogram` 时，掩膜面板隐藏（小程序码没掩膜），只显示"重新采样"和导出
+1. `wx_grid_to_diff_preview_image`：把小程序码生成预览映射回原图二值图，按像素比较原图/生成图黑白差异
+2. UI 中识别到 `CodeKind::WxMiniprogram` 时，掩膜面板隐藏（小程序码没掩膜），显示"重新采样"、"显示差异"和差异像素数
+3. 状态栏写明红色=原图有生成图没有、蓝色=原图没有生成图有
 
-**验收**：完整流程能跑通：粘贴小程序码 → 自动识别 → 矢量预览 → 导出 SVG
+**验收**：完整流程能跑通：粘贴小程序码 → 自动识别 → 矢量预览/差异预览 → 导出 SVG
 
 ---
 
@@ -795,7 +836,7 @@ fn grid_sampling_recovers_perfect_qr() {
        pub cy: f64,
        pub rings: Vec<f64>, // 每层嵌套圆半径
    }
-
+   
    pub fn find_dy_finders(bin: &BinaryImage) -> Vec<DyFinder>;
    ```
 2. 算法：复用 5.1 的轮廓 + 圆度 + 嵌套检测，但抖音码定位点是 3 层嵌套同心圆（不像小程序码的牛眼是同心圆+点）
@@ -814,7 +855,7 @@ fn grid_sampling_recovers_perfect_qr() {
        pub points_per_ring: u32,  // 72 / 120
        pub has_border: bool,      // 黑框版 / 无框版
    }
-
+   
    pub fn detect_dy_params(
        bin: &BinaryImage,
        finders: &[DyFinder; 3],
@@ -896,23 +937,20 @@ fn grid_sampling_recovers_perfect_qr() {
 
 ---
 
-## 阶段 7（可选）：后台任务运行器
+## 阶段 7（部分前置完成）：后台任务运行器
 
-**触发条件**：用户报告"自动选最佳掩膜"或"复杂截图识别"卡顿（UI 冻结 > 500ms）
+**触发条件**：用户报告粘贴/打开后 UI 等待结果期间没有反馈，容易误以为软件卡死。
 
-**步骤**：
-1. 新建 `src/job/runner.rs`：
-   ```rust
-   pub struct JobRunner {
-       sender: mpsc::Sender<Job>,
-       receiver: mpsc::Receiver<JobResult>,
-   }
+**当前完成（2026-05-31）**：
+- 已在 `QRacerApp` 内用轻量 `std::sync::mpsc` + `std::thread` 接入后台处理：导入图片后立即显示左侧原图，右侧预览区和状态栏显示 loading；后台完成后一次性回填码类型、校正图、SVG、差异数和预览
+- 已新增 `src/screen_capture.rs`：点击"截屏"后最小化主窗口，显示 Win32 全屏透明遮罩；用户拖拽框选区域后用 GDI `BitBlt` 捕获并按普通图片导入流程处理
+- 已修复截屏框选后主窗口不恢复的问题：不再隐藏主窗口，改为最小化以保留任务栏入口；截屏线程结束时主动唤醒 egui、排队取消最小化，并用 Win32 `ShowWindow(SW_RESTORE)` 做原生还原兜底
+- 当前没有单独创建 `src/job/runner.rs`，因为后台任务类型仍少；阶段 6/7 若增加 EMF 写剪贴板、批量处理或取消任务，再抽出统一 runner
 
-   pub enum Job { ... }
-   pub enum JobResult { ... }
-   ```
-2. 在工作线程跑识别/重生成
-3. UI 每帧 `try_recv()`，并显示加载 spinner
+**后续可选步骤**：
+1. 新建 `src/job/runner.rs`，统一 `Job` / `JobResult` / 取消令牌
+2. 把掩膜重算、网格兜底、EMF 写剪贴板也迁入后台任务
+3. 为长任务增加真实阶段进度，而不是当前的循环 loading
 
 ---
 
@@ -937,7 +975,7 @@ fn grid_sampling_recovers_perfect_qr() {
 | `eframe` / `egui` / `egui_extras` | GUI | 1 |
 | `image` | 图像 IO | 1 |
 | `arboard` | 剪贴板读图 | 1 |
-| `windows-sys` | Windows 前台 `Ctrl+V` 图片粘贴快捷键检测 | 1 |
+| `windows-sys` | Windows 前台 `Ctrl+V` 图片粘贴快捷键检测；截屏遮罩和 GDI 屏幕捕获 | 1 |
 | `rfd` | 文件对话框 | 1 |
 | `anyhow` | 应用层错误 | 1 |
 | `imageproc` | 二值化、形态学、轮廓 | 2 |

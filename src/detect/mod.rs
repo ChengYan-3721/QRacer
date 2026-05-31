@@ -12,6 +12,11 @@ pub fn detect_kind(bin: &BinaryImage) -> CodeKind {
         return CodeKind::Qr;
     }
 
+    let wx_finders = finder_wx::find_wx_finders(bin);
+    if finder_wx::select_wx_finders(&wx_finders).is_some() {
+        return CodeKind::WxMiniprogram;
+    }
+
     CodeKind::Unknown
 }
 
@@ -33,6 +38,19 @@ mod tests {
         let bin = BinaryImage::new(80, 80, vec![255; 80 * 80]);
 
         assert_eq!(detect_kind(&bin), CodeKind::Unknown);
+    }
+
+    #[test]
+    fn detect_kind_returns_wx_for_standard_sample() {
+        let path = std::path::Path::new("samples/小程序码1.jpg");
+        if !path.exists() {
+            return;
+        }
+
+        let img = image::open(path).unwrap();
+        let bin = crate::pipeline::preprocess::preprocess(&img);
+
+        assert_eq!(detect_kind(&bin), CodeKind::WxMiniprogram);
     }
 
     fn render_qr_binary(qr: &QrCode, scale: u32, border: u32) -> BinaryImage {

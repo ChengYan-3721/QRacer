@@ -83,7 +83,6 @@ pub fn select_qr_finder_triplet(bin: &BinaryImage, finders: &[QrFinder]) -> Opti
     }
 
     let mut best: Option<(f64, [QrFinder; 3])> = None;
-
     for a in 0..finders.len() - 2 {
         for b in a + 1..finders.len() - 1 {
             for c in b + 1..finders.len() {
@@ -148,6 +147,19 @@ fn score_finder_triplet(bin: &BinaryImage, finders: [QrFinder; 3]) -> Option<f64
     }
 
     let (tl, tr, bl) = order_finder_triplet(finders);
+    let module = avg_module.max(1.0);
+    let u_axis = unit_vector(tl, tr, module);
+    let v_axis = unit_vector(tl, bl, module);
+    let finder_scores = [
+        finder_template_score(bin, tl, u_axis, v_axis),
+        finder_template_score(bin, tr, u_axis, v_axis),
+        finder_template_score(bin, bl, u_axis, v_axis),
+    ];
+    let min_finder_score = finder_scores.iter().copied().fold(1.0, f64::min);
+    if min_finder_score < 0.20 {
+        return None;
+    }
+    let finder_score = finder_scores.iter().sum::<f64>() / finder_scores.len() as f64;
     let timing_score = timing_pattern_score(bin, tl, tr, bl);
 
     let normalized_area = area / (avg_module * avg_module);
@@ -156,6 +168,8 @@ fn score_finder_triplet(bin: &BinaryImage, finders: [QrFinder; 3]) -> Option<f64
             - right_error * 40.0
             - (leg_ratio - 1.0).abs() * 8.0
             - (module_ratio - 1.0) * 12.0
+            + finder_score * 520.0
+            + min_finder_score * 260.0
             + timing_score * 35.0,
     )
 }
@@ -200,6 +214,39 @@ fn timing_pattern_score(bin: &BinaryImage, tl: QrFinder, tr: QrFinder, bl: QrFin
     let vertical = timing_axis_score(bin, tl, v, u, modules);
 
     (horizontal + vertical) * 0.5
+}
+
+fn finder_template_score(
+    bin: &BinaryImage,
+    finder: QrFinder,
+    u_axis: (f64, f64),
+    v_axis: (f64, f64),
+) -> f64 {
+    let mut matches = 0_u32;
+    let mut total = 0_u32;
+
+    for y in 0..7 {
+        for x in 0..7 {
+            let dx = x as f64 - 3.0;
+            let dy = y as f64 - 3.0;
+            let sample = (
+                finder.cx + u_axis.0 * dx + v_axis.0 * dy,
+                finder.cy + u_axis.1 * dx + v_axis.1 * dy,
+            );
+            let actual = bilinear_sample(bin, sample.0, sample.1) < 128.0;
+            let expected = x == 0
+                || x == 6
+                || y == 0
+                || y == 6
+                || ((2..=4).contains(&x) && (2..=4).contains(&y));
+            if actual == expected {
+                matches += 1;
+            }
+            total += 1;
+        }
+    }
+
+    matches as f64 / total as f64
 }
 
 fn timing_axis_score(

@@ -10,6 +10,7 @@ mod detect;
 mod error;
 mod image_io;
 mod pipeline;
+mod screen_capture;
 mod ui;
 mod vector;
 
@@ -17,9 +18,9 @@ use app::QRacerApp;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0])
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([860.0, 520.0])
+            .with_min_inner_size([860.0, 520.0])
             .with_title("QRacer"),
         ..Default::default()
     };

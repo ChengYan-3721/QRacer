@@ -33,7 +33,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
         }
 
         if ui
-            .button("网格兜底")
+            .button("网格像素匹配")
             .on_hover_text("直接按校正图模块采样")
             .clicked()
         {
@@ -54,15 +54,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
         ui.label(diff_text);
 
         if let Some(decoded) = app.last_decoded.as_ref() {
-            let original_mask = decoded
-                .original_mask
-                .map(|mask| mask.to_string())
-                .unwrap_or_else(|| "-".to_owned());
+            let mask_text = app
+                .matched_mask
+                .map(|mask| format!("原掩膜 {mask}"))
+                .unwrap_or_else(|| "无匹配掩膜".to_owned());
             ui.label(format!(
-                "V{} / ECC {} / 原掩膜 {}",
+                "V{} / ECC {} / {}",
                 decoded.version,
                 decoded.ecc.label(),
-                original_mask
+                mask_text
             ));
         } else if let Some(version) = app.qr_version {
             ui.label(format!("V{version} / 未解码 / 可网格兜底"));

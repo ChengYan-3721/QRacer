@@ -5,13 +5,16 @@
 use crate::app::QRacerApp;
 use eframe::egui;
 
-pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
+pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
     ui.horizontal_wrapped(|ui| {
         if ui.button("粘贴 (Ctrl+V)").clicked() {
             app.try_paste_from_clipboard();
         }
         if ui.button("打开...").clicked() {
             app.try_open_file();
+        }
+        if ui.button("截屏").clicked() {
+            app.try_capture_screen(ctx);
         }
 
         ui.separator();

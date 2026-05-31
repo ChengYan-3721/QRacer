@@ -1,9 +1,17 @@
-use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, Vector3};
 
 use crate::detect::finder_qr::QrFinder;
+use crate::detect::finder_wx::WxFinder;
 use crate::pipeline::preprocess::BinaryImage;
+use image::{DynamicImage, Rgba, RgbaImage};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WxUprightAnchor {
+    Badge((f64, f64)),
+}
 
 /// Warps a detected QR code into a square binary image of `target_size`.
+#[cfg(test)]
 pub fn warp_qr_to_square(
     bin: &BinaryImage,
     finders: &[QrFinder; 3],
@@ -41,6 +49,178 @@ pub fn warp_qr_to_square(
     }
 
     BinaryImage::new(target_size, target_size, data)
+}
+
+pub fn warp_qr_to_square_image(
+    image: &DynamicImage,
+    bin: &BinaryImage,
+    finders: &[QrFinder; 3],
+    target_size: u32,
+) -> DynamicImage {
+    let size = target_size.max(1);
+    let (tl, tr, bl) = order_qr_finders(finders);
+    let src = qr_outer_corners(bin, tl, tr, bl);
+    let max = size.saturating_sub(1) as f64;
+    let dst = [(0.0, 0.0), (max, 0.0), (0.0, max), (max, max)];
+    let h = homography_from_4pts(&src, &dst);
+    let Some(inv) = h.try_inverse() else {
+        return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            size,
+            size,
+            Rgba([255, 255, 255, 255]),
+        ));
+    };
+
+    let source = image.to_rgba8();
+    let mut out = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
+    for y in 0..size {
+        for x in 0..size {
+            let p = inv * Vector3::new(x as f64, y as f64, 1.0);
+            if p.z.abs() < f64::EPSILON {
+                continue;
+            }
+            let sx = p.x / p.z;
+            let sy = p.y / p.z;
+            out.put_pixel(x, y, bilinear_sample_rgba(&source, sx, sy));
+        }
+    }
+
+    DynamicImage::ImageRgba8(out)
+}
+
+pub fn warp_wx_to_upright_binary(
+    bin: &BinaryImage,
+    finders: &[WxFinder; 3],
+    anchor: Option<WxUprightAnchor>,
+    target_size: u32,
+) -> BinaryImage {
+    if target_size == 0 {
+        return BinaryImage::new(0, 0, Vec::new());
+    }
+
+    let Some(inv) = wx_upright_to_source_homography(finders, anchor, target_size) else {
+        return BinaryImage::new(
+            target_size,
+            target_size,
+            vec![255; (target_size * target_size) as usize],
+        );
+    };
+
+    let mut data = vec![255; (target_size * target_size) as usize];
+    for y in 0..target_size {
+        for x in 0..target_size {
+            let p = inv * Vector3::new(x as f64, y as f64, 1.0);
+            if p.z.abs() < f64::EPSILON {
+                continue;
+            }
+            let sx = p.x / p.z;
+            let sy = p.y / p.z;
+            let value = bilinear_sample(bin, sx, sy);
+            data[(y * target_size + x) as usize] = if value < 128.0 { 0 } else { 255 };
+        }
+    }
+
+    BinaryImage::new(target_size, target_size, data)
+}
+
+pub fn warp_wx_to_upright_image(
+    image: &DynamicImage,
+    finders: &[WxFinder; 3],
+    anchor: Option<WxUprightAnchor>,
+    target_size: u32,
+) -> DynamicImage {
+    let size = target_size.max(1);
+    let Some(inv) = wx_upright_to_source_homography(finders, anchor, size) else {
+        return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            size,
+            size,
+            Rgba([255, 255, 255, 255]),
+        ));
+    };
+
+    let source = image.to_rgba8();
+    let mut out = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
+    for y in 0..size {
+        for x in 0..size {
+            let p = inv * Vector3::new(x as f64, y as f64, 1.0);
+            if p.z.abs() < f64::EPSILON {
+                continue;
+            }
+            let sx = p.x / p.z;
+            let sy = p.y / p.z;
+            out.put_pixel(x, y, bilinear_sample_rgba(&source, sx, sy));
+        }
+    }
+
+    DynamicImage::ImageRgba8(out)
+}
+
+pub fn detect_wx_badge_anchor(image: &DynamicImage) -> Option<(f64, f64)> {
+    let rgba = image.to_rgba8();
+    let mut visited = vec![false; (rgba.width() * rgba.height()) as usize];
+    let min_dim = rgba.width().min(rgba.height()) as f64;
+    let min_area = (min_dim * 0.045).powi(2) as u32;
+    let mut best: Option<(f64, (f64, f64))> = None;
+
+    for y in 0..rgba.height() as i32 {
+        for x in 0..rgba.width() as i32 {
+            let idx = (y as u32 * rgba.width() + x as u32) as usize;
+            if visited[idx] || !is_wx_badge_shape_pixel(rgba.get_pixel(x as u32, y as u32).0) {
+                continue;
+            }
+
+            let Some(component) = flood_badge_shape_component(&rgba, &mut visited, x, y) else {
+                continue;
+            };
+            if component.area < min_area {
+                continue;
+            }
+            let center = component.center();
+            if center.0 < rgba.width() as f64 * 0.55 || center.1 < rgba.height() as f64 * 0.55 {
+                continue;
+            }
+            if !component.is_badge_like(min_dim) {
+                continue;
+            }
+
+            let score = component.area as f64 * component.shape_score();
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score > *best_score)
+            {
+                best = Some((score, center));
+            }
+        }
+    }
+
+    best.map(|(_, center)| center)
+        .or_else(|| scan_badge_shape_anchor(&rgba))
+}
+
+pub fn wx_upright_target_finders(_finders: &[WxFinder; 3], target_size: u32) -> [WxFinder; 3] {
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let target_leg = far - margin;
+    let radius = (target_leg * 0.0786).max(1.0);
+
+    [
+        WxFinder {
+            cx: margin,
+            cy: margin,
+            r_outer: radius,
+        },
+        WxFinder {
+            cx: far,
+            cy: margin,
+            r_outer: radius,
+        },
+        WxFinder {
+            cx: margin,
+            cy: far,
+            r_outer: radius,
+        },
+    ]
 }
 
 /// Computes a projective transform mapping `src` points to `dst` points.
@@ -109,7 +289,7 @@ fn qr_outer_corners(
 
     for modules in module_counts {
         if let Some(alignment) = find_bottom_right_alignment(bin, corners, modules, (tl, tr, bl)) {
-            return qr_outer_corners_from_alignment(modules, corners, alignment);
+            return qr_outer_corners_from_alignment_points(modules, tl, tr, bl, alignment);
         }
     }
 
@@ -256,61 +436,30 @@ fn alignment_template_matches(
     matches
 }
 
-fn qr_outer_corners_from_alignment(
+fn qr_outer_corners_from_alignment_points(
     modules: usize,
-    corners: [(f64, f64); 4],
+    tl: QrFinder,
+    tr: QrFinder,
+    bl: QrFinder,
     alignment: (f64, f64),
 ) -> [(f64, f64); 4] {
     let modules = modules as f64;
-    let row = sub_tuple(corners[1], corners[0]);
-    let col = sub_tuple(corners[2], corners[0]);
-    let expected = (modules - 6.5, modules - 6.5);
-    let mut best = corners[3];
-    let mut best_error =
-        alignment_error_for_bottom_right(corners, best, alignment, expected, modules);
-
-    for radius in [0.35, 0.16, 0.07, 0.03] {
-        let origin = best;
-        for iy in -5..=5 {
-            for ix in -5..=5 {
-                let candidate = (
-                    origin.0 + row.0 * ix as f64 / 5.0 * radius + col.0 * iy as f64 / 5.0 * radius,
-                    origin.1 + row.1 * ix as f64 / 5.0 * radius + col.1 * iy as f64 / 5.0 * radius,
-                );
-                let error = alignment_error_for_bottom_right(
-                    corners, candidate, alignment, expected, modules,
-                );
-                if error < best_error {
-                    best_error = error;
-                    best = candidate;
-                }
-            }
-        }
-    }
-
-    [corners[0], corners[1], corners[2], best]
-}
-
-fn alignment_error_for_bottom_right(
-    corners: [(f64, f64); 4],
-    bottom_right: (f64, f64),
-    alignment: (f64, f64),
-    expected: (f64, f64),
-    modules: f64,
-) -> f64 {
-    let source_to_modules = homography_from_4pts(
-        &[corners[0], corners[1], corners[2], bottom_right],
+    let module_to_source = homography_from_4pts(
         &[
-            (0.0, 0.0),
-            (modules, 0.0),
-            (0.0, modules),
-            (modules, modules),
+            (3.5, 3.5),
+            (modules - 3.5, 3.5),
+            (3.5, modules - 3.5),
+            (modules - 6.5, modules - 6.5),
         ],
+        &[(tl.cx, tl.cy), (tr.cx, tr.cy), (bl.cx, bl.cy), alignment],
     );
-    let actual = apply_homography_point(&source_to_modules, alignment);
-    let dx = actual.0 - expected.0;
-    let dy = actual.1 - expected.1;
-    dx * dx + dy * dy
+
+    [
+        apply_homography_point(&module_to_source, (0.0, 0.0)),
+        apply_homography_point(&module_to_source, (modules, 0.0)),
+        apply_homography_point(&module_to_source, (0.0, modules)),
+        apply_homography_point(&module_to_source, (modules, modules)),
+    ]
 }
 
 fn apply_homography_point(h: &Matrix3<f64>, point: (f64, f64)) -> (f64, f64) {
@@ -361,6 +510,115 @@ fn cross(origin: QrFinder, a: QrFinder, b: QrFinder) -> f64 {
     ax * by - ay * bx
 }
 
+fn wx_upright_to_source_homography(
+    finders: &[WxFinder; 3],
+    anchor: Option<WxUprightAnchor>,
+    target_size: u32,
+) -> Option<Matrix3<f64>> {
+    let (tl, tr, bl) = order_wx_finders(finders);
+    let br = (tr.cx + bl.cx - tl.cx, tr.cy + bl.cy - tl.cy);
+    let src = vec![
+        (tl.cx, tl.cy),
+        (tr.cx, tr.cy),
+        (bl.cx, bl.cy),
+        match anchor {
+            Some(WxUprightAnchor::Badge(point)) => point,
+            None => br,
+        },
+    ];
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let leg = max - margin * 2.0;
+    let dst = vec![
+        (margin, margin),
+        (max - margin, margin),
+        (margin, max - margin),
+        match anchor {
+            Some(WxUprightAnchor::Badge(_)) => {
+                let far = max - margin;
+                let badge_offset = leg * 0.011;
+                (far + badge_offset, far + badge_offset)
+            }
+            None => (max - margin, max - margin),
+        },
+    ];
+    let weights = vec![1.0; src.len()];
+    homography_from_points(&src, &dst, &weights)?.try_inverse()
+}
+
+fn homography_from_points(
+    src: &[(f64, f64)],
+    dst: &[(f64, f64)],
+    weights: &[f64],
+) -> Option<Matrix3<f64>> {
+    if src.len() != dst.len() || src.len() < 4 || src.len() != weights.len() {
+        return None;
+    }
+
+    let mut a = DMatrix::<f64>::zeros(src.len() * 2, 8);
+    let mut b = DVector::<f64>::zeros(src.len() * 2);
+
+    for (i, ((x, y), (u, v))) in src.iter().zip(dst).enumerate() {
+        let row = i * 2;
+        let weight = weights[i].max(f64::EPSILON);
+        a[(row, 0)] = *x * weight;
+        a[(row, 1)] = *y * weight;
+        a[(row, 2)] = weight;
+        a[(row, 6)] = -*u * *x * weight;
+        a[(row, 7)] = -*u * *y * weight;
+        b[row] = *u * weight;
+
+        a[(row + 1, 3)] = *x * weight;
+        a[(row + 1, 4)] = *y * weight;
+        a[(row + 1, 5)] = weight;
+        a[(row + 1, 6)] = -*v * *x * weight;
+        a[(row + 1, 7)] = -*v * *y * weight;
+        b[row + 1] = *v * weight;
+    }
+
+    let h = a.svd(true, true).solve(&b, 1e-9).ok()?;
+    Some(Matrix3::new(
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1.0,
+    ))
+}
+
+fn order_wx_finders(finders: &[WxFinder; 3]) -> (WxFinder, WxFinder, WxFinder) {
+    let distances = [
+        (0, 1, squared_distance_wx(finders[0], finders[1])),
+        (0, 2, squared_distance_wx(finders[0], finders[2])),
+        (1, 2, squared_distance_wx(finders[1], finders[2])),
+    ];
+    let &(a_idx, b_idx, _) = distances
+        .iter()
+        .max_by(|lhs, rhs| lhs.2.total_cmp(&rhs.2))
+        .expect("three finder distances exist");
+
+    let tl_idx = 3 - a_idx - b_idx;
+    let tl = finders[tl_idx];
+    let a = finders[a_idx];
+    let b = finders[b_idx];
+
+    if cross_wx(tl, a, b) > 0.0 {
+        (tl, a, b)
+    } else {
+        (tl, b, a)
+    }
+}
+
+fn squared_distance_wx(a: WxFinder, b: WxFinder) -> f64 {
+    let dx = a.cx - b.cx;
+    let dy = a.cy - b.cy;
+    dx * dx + dy * dy
+}
+
+fn cross_wx(origin: WxFinder, a: WxFinder, b: WxFinder) -> f64 {
+    let ax = a.cx - origin.cx;
+    let ay = a.cy - origin.cy;
+    let bx = b.cx - origin.cx;
+    let by = b.cy - origin.cy;
+    ax * by - ay * bx
+}
+
 fn bilinear_sample(bin: &BinaryImage, x: f64, y: f64) -> f64 {
     if x < 0.0
         || y < 0.0
@@ -385,6 +643,234 @@ fn bilinear_sample(bin: &BinaryImage, x: f64, y: f64) -> f64 {
     let bottom = p01 * (1.0 - tx) + p11 * tx;
 
     top * (1.0 - ty) + bottom * ty
+}
+
+fn bilinear_sample_rgba(image: &RgbaImage, x: f64, y: f64) -> Rgba<u8> {
+    if x < 0.0
+        || y < 0.0
+        || x > (image.width().saturating_sub(1)) as f64
+        || y > (image.height().saturating_sub(1)) as f64
+    {
+        return Rgba([255, 255, 255, 255]);
+    }
+
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let tx = x - x0 as f64;
+    let ty = y - y0 as f64;
+    let p00 = rgba_pixel(image, x0, y0);
+    let p10 = rgba_pixel(image, x1, y0);
+    let p01 = rgba_pixel(image, x0, y1);
+    let p11 = rgba_pixel(image, x1, y1);
+    let mut out = [255_u8; 4];
+
+    for channel in 0..4 {
+        let top = p00[channel] * (1.0 - tx) + p10[channel] * tx;
+        let bottom = p01[channel] * (1.0 - tx) + p11[channel] * tx;
+        out[channel] = (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8;
+    }
+
+    Rgba(out)
+}
+
+fn rgba_pixel(image: &RgbaImage, x: i32, y: i32) -> [f64; 4] {
+    if x < 0 || y < 0 || x >= image.width() as i32 || y >= image.height() as i32 {
+        return [255.0, 255.0, 255.0, 255.0];
+    }
+    let pixel = image.get_pixel(x as u32, y as u32).0;
+    [
+        pixel[0] as f64,
+        pixel[1] as f64,
+        pixel[2] as f64,
+        pixel[3] as f64,
+    ]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BadgeShapeComponent {
+    area: u32,
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+}
+
+impl BadgeShapeComponent {
+    fn center(self) -> (f64, f64) {
+        (
+            (self.min_x + self.max_x) as f64 * 0.5,
+            (self.min_y + self.max_y) as f64 * 0.5,
+        )
+    }
+
+    fn width(self) -> f64 {
+        (self.max_x - self.min_x + 1) as f64
+    }
+
+    fn height(self) -> f64 {
+        (self.max_y - self.min_y + 1) as f64
+    }
+
+    fn is_badge_like(self, min_dim: f64) -> bool {
+        let width = self.width();
+        let height = self.height();
+        if width < min_dim * 0.08 || height < min_dim * 0.08 {
+            return false;
+        }
+
+        let aspect = width / height.max(1.0);
+        if !(0.55..=1.80).contains(&aspect) {
+            return false;
+        }
+
+        let fill = self.fill();
+        (0.22..=1.18).contains(&fill)
+    }
+
+    fn shape_score(self) -> f64 {
+        let aspect = self.width() / self.height().max(1.0);
+        let aspect_score = 1.0 - (aspect.ln().abs() / 0.8).min(0.8);
+        let ellipse_area = std::f64::consts::PI * self.width() * self.height() * 0.25;
+        let fill = self.area as f64 / ellipse_area.max(1.0);
+        let fill_score = 1.0 - (fill - 0.72).abs().min(0.5);
+        aspect_score.max(0.1) * fill_score.max(0.1)
+    }
+
+    fn fill(self) -> f64 {
+        let ellipse_area = std::f64::consts::PI * self.width() * self.height() * 0.25;
+        self.area as f64 / ellipse_area.max(1.0)
+    }
+}
+
+fn flood_badge_shape_component(
+    image: &RgbaImage,
+    visited: &mut [bool],
+    start_x: i32,
+    start_y: i32,
+) -> Option<BadgeShapeComponent> {
+    let mut stack = vec![(start_x, start_y)];
+    let mut area = 0_u32;
+    let mut min_x = start_x;
+    let mut max_x = start_x;
+    let mut min_y = start_y;
+    let mut max_y = start_y;
+
+    while let Some((x, y)) = stack.pop() {
+        if x < 0 || y < 0 || x >= image.width() as i32 || y >= image.height() as i32 {
+            continue;
+        }
+
+        let idx = (y as u32 * image.width() + x as u32) as usize;
+        if visited[idx] || !is_wx_badge_shape_pixel(image.get_pixel(x as u32, y as u32).0) {
+            continue;
+        }
+
+        visited[idx] = true;
+        area += 1;
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+        stack.push((x - 1, y));
+        stack.push((x + 1, y));
+        stack.push((x, y - 1));
+        stack.push((x, y + 1));
+    }
+
+    (area > 0).then_some(BadgeShapeComponent {
+        area,
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    })
+}
+
+fn is_wx_badge_shape_pixel(pixel: [u8; 4]) -> bool {
+    let [r, g, b, a] = pixel;
+    let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+    a > 128 && (45.0..=180.0).contains(&luma)
+}
+
+fn scan_badge_shape_anchor(image: &RgbaImage) -> Option<(f64, f64)> {
+    let min_dim = image.width().min(image.height()) as f64;
+    let radius_min = (min_dim * 0.055).max(12.0);
+    let radius_max = (min_dim * 0.145).max(radius_min + 1.0);
+    let step = ((min_dim / 70.0).round() as i32).max(4);
+    let radius_step = ((min_dim / 120.0).round() as i32).max(2);
+    let x0 = (image.width() as f64 * 0.56) as i32;
+    let x1 = (image.width() as f64 * 0.90) as i32;
+    let y0 = (image.height() as f64 * 0.56) as i32;
+    let y1 = (image.height() as f64 * 0.90) as i32;
+    let mut best: Option<(f64, (f64, f64))> = None;
+
+    let mut y = y0;
+    while y <= y1 {
+        let mut x = x0;
+        while x <= x1 {
+            let mut radius = radius_min;
+            while radius <= radius_max {
+                let score = badge_template_score(image, x as f64, y as f64, radius);
+                if score > 0.34
+                    && best
+                        .as_ref()
+                        .is_none_or(|(best_score, _)| score > *best_score)
+                {
+                    best = Some((score, (x as f64, y as f64)));
+                }
+                radius += radius_step as f64;
+            }
+            x += step;
+        }
+        y += step;
+    }
+
+    best.map(|(_, center)| center)
+}
+
+fn badge_template_score(image: &RgbaImage, cx: f64, cy: f64, radius: f64) -> f64 {
+    let samples = 17;
+    let mut inner_hits = 0_u32;
+    let mut inner_total = 0_u32;
+    let mut outer_hits = 0_u32;
+    let mut outer_total = 0_u32;
+
+    for iy in 0..samples {
+        for ix in 0..samples {
+            let dx = (ix as f64 / (samples - 1) as f64 - 0.5) * radius * 3.0;
+            let dy = (iy as f64 / (samples - 1) as f64 - 0.5) * radius * 3.0;
+            let d = dx.hypot(dy) / radius;
+            let x = (cx + dx).round() as i32;
+            let y = (cy + dy).round() as i32;
+            let hit = x >= 0
+                && y >= 0
+                && x < image.width() as i32
+                && y < image.height() as i32
+                && is_wx_badge_shape_pixel(image.get_pixel(x as u32, y as u32).0);
+
+            if d <= 0.88 {
+                inner_total += 1;
+                if hit {
+                    inner_hits += 1;
+                }
+            } else if (1.08..=1.42).contains(&d) {
+                outer_total += 1;
+                if hit {
+                    outer_hits += 1;
+                }
+            }
+        }
+    }
+
+    if inner_total == 0 || outer_total == 0 {
+        return 0.0;
+    }
+
+    let inner = inner_hits as f64 / inner_total as f64;
+    let outer = outer_hits as f64 / outer_total as f64;
+    inner - outer * 0.75
 }
 
 #[cfg(test)]
