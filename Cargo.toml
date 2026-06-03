@@ -19,8 +19,7 @@ nalgebra = "0.33"
 rxing = "0.7"
 qrcodegen = "1.8"
 
-# 剪贴板：阶段 1 用 arboard 读取剪贴板图像
-# 阶段 6 写 EMF 到剪贴板时再加 clipboard-win + windows
+# 剪贴板：arboard 读取剪贴板图像，也负责写 SVG 文本到剪贴板
 arboard = "3"
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
@@ -36,3 +35,10 @@ rfd = "0.15"
 # 错误处理
 anyhow = "1"
 thiserror = "2"
+
+[profile.release]
+codegen-units = 1 # 允许 LLVM 执行更好的优化。
+lto = true # 启用链接时优化。
+opt-level = "z" # 优先考虑小的二进制文件大小。如果您更喜欢速度，请使用 `3`。
+panic = "abort" # 小工具发布包不展开 panic，减少二进制体积。
+strip = true # 确保移除调试符号。

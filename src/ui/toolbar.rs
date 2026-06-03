@@ -1,6 +1,4 @@
 // 顶部工具栏：粘贴 / 打开 / 导出 / 复制 + 码类型显示。
-//
-// 阶段 1：粘贴和打开真实工作；导出/复制按钮渲染但禁用。
 
 use crate::app::QRacerApp;
 use eframe::egui;
@@ -25,7 +23,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
         {
             app.try_export_svg();
         }
-        ui.add_enabled(false, egui::Button::new("复制矢量"));
+        if ui
+            .add_enabled(app.can_copy_vector(), egui::Button::new("复制到剪贴板"))
+            .clicked()
+        {
+            app.try_copy_vector();
+        }
 
         ui.separator();
 

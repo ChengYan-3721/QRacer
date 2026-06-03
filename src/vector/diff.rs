@@ -2,8 +2,7 @@ use std::collections::HashSet;
 
 use image::{DynamicImage, Rgba, RgbaImage};
 
-use crate::codec::qr::{QrMatrix, sample_qr_module};
-use crate::pipeline::preprocess::BinaryImage;
+use crate::codec::qr::QrMatrix;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffResult {
@@ -13,23 +12,23 @@ pub struct DiffResult {
     pub diff_count: u32,
 }
 
-pub fn compute_diff(warped_original: &BinaryImage, generated_matrix: &QrMatrix) -> DiffResult {
+pub fn compute_matrix_diff(
+    reference_matrix: &QrMatrix,
+    generated_matrix: &QrMatrix,
+) -> Option<DiffResult> {
     let modules = generated_matrix.len();
-    if modules == 0 {
-        return DiffResult {
-            diff_modules: Vec::new(),
-            missing_in_generated: Vec::new(),
-            extra_in_generated: Vec::new(),
-            diff_count: 0,
-        };
+    if !is_square_matrix(reference_matrix, modules) || !is_square_matrix(generated_matrix, modules)
+    {
+        return None;
     }
 
     let mut diff_modules = Vec::new();
     let mut missing_in_generated = Vec::new();
     let mut extra_in_generated = Vec::new();
-    for (y, row) in generated_matrix.iter().enumerate() {
-        for (x, &expected) in row.iter().enumerate() {
-            let actual = sample_qr_module(warped_original, modules, x, y);
+    for y in 0..modules {
+        for x in 0..modules {
+            let actual = reference_matrix[y][x];
+            let expected = generated_matrix[y][x];
             if actual != expected {
                 let module = (x as u32, y as u32);
                 diff_modules.push(module);
@@ -42,12 +41,16 @@ pub fn compute_diff(warped_original: &BinaryImage, generated_matrix: &QrMatrix) 
         }
     }
 
-    DiffResult {
+    Some(DiffResult {
         diff_count: diff_modules.len() as u32,
         diff_modules,
         missing_in_generated,
         extra_in_generated,
-    }
+    })
+}
+
+fn is_square_matrix(matrix: &QrMatrix, modules: usize) -> bool {
+    matrix.len() == modules && matrix.iter().all(|row| row.len() == modules)
 }
 
 pub fn render_qr_diff_preview(
@@ -104,7 +107,6 @@ pub fn render_qr_diff_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::svg::qr_matrix_to_binary;
 
     #[test]
     fn identical_matrix_has_zero_diff() {
@@ -113,9 +115,8 @@ mod tests {
             vec![false, true, false],
             vec![true, false, true],
         ];
-        let warped = qr_matrix_to_binary(&matrix, 8, 0);
 
-        let diff = compute_diff(&warped, &matrix);
+        let diff = compute_matrix_diff(&matrix, &matrix).unwrap();
 
         assert_eq!(diff.diff_count, 0);
         assert!(diff.missing_in_generated.is_empty());
@@ -131,14 +132,33 @@ mod tests {
         ];
         let mut changed = matrix.clone();
         changed[1][1] = false;
-        let warped = qr_matrix_to_binary(&matrix, 8, 0);
 
-        let diff = compute_diff(&warped, &changed);
+        let diff = compute_matrix_diff(&matrix, &changed).unwrap();
 
         assert_eq!(diff.diff_count, 1);
         assert_eq!(diff.diff_modules, vec![(1, 1)]);
         assert_eq!(diff.missing_in_generated, vec![(1, 1)]);
         assert!(diff.extra_in_generated.is_empty());
+    }
+
+    #[test]
+    fn matrix_diff_uses_reference_as_original() {
+        let reference = vec![vec![true, false], vec![false, true]];
+        let generated = vec![vec![false, true], vec![false, true]];
+
+        let diff = compute_matrix_diff(&reference, &generated).unwrap();
+
+        assert_eq!(diff.diff_count, 2);
+        assert_eq!(diff.missing_in_generated, vec![(0, 0)]);
+        assert_eq!(diff.extra_in_generated, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn matrix_diff_rejects_dimension_mismatch() {
+        let reference = vec![vec![true, false]];
+        let generated = vec![vec![true, false], vec![false, true]];
+
+        assert!(compute_matrix_diff(&reference, &generated).is_none());
     }
 
     #[test]

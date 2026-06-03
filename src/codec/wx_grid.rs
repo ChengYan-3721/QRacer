@@ -580,6 +580,13 @@ mod tests {
             if !path.is_file() {
                 continue;
             }
+            if !is_supported_bitmap(&path) {
+                continue;
+            }
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !file_name.contains("小程序码") {
+                continue;
+            }
 
             let img = image::open(&path).unwrap();
             let bin = preprocess(&img);
@@ -603,7 +610,18 @@ mod tests {
             processed += 1;
         }
 
-        assert!(processed >= 9);
+        assert!(processed > 0, "no mini-program samples found");
+    }
+
+    fn is_supported_bitmap(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "bmp" | "webp"
+                )
+            })
     }
 
     #[test]

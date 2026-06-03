@@ -65,7 +65,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
                 mask_text
             ));
         } else if let Some(version) = app.qr_version {
-            ui.label(format!("V{version} / 未解码 / 可网格兜底"));
+            ui.label(format!("V{version} / 未解码 / 可网格像素匹配"));
         }
     });
 }
