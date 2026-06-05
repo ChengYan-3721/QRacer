@@ -1,5 +1,6 @@
 use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, Vector3};
 
+use crate::detect::finder_dy::DyFinder;
 use crate::detect::finder_qr::QrFinder;
 use crate::detect::finder_wx::WxFinder;
 use crate::pipeline::preprocess::BinaryImage;
@@ -9,6 +10,16 @@ use image::{DynamicImage, Rgba, RgbaImage};
 pub enum WxUprightAnchor {
     Badge((f64, f64)),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DyBadgeAnchor {
+    pub cx: f64,
+    pub cy: f64,
+    pub radius: f64,
+}
+
+const DY_BADGE_CENTER_DX_PER_LOCATOR_LEG: f64 = 8.78 / 369.71;
+const DY_BADGE_CENTER_DY_PER_LOCATOR_LEG: f64 = -9.32 / 369.71;
 
 /// Warps a detected QR code into a square binary image of `target_size`.
 #[cfg(test)]
@@ -219,6 +230,181 @@ pub fn wx_upright_target_finders(_finders: &[WxFinder; 3], target_size: u32) -> 
             cx: margin,
             cy: far,
             r_outer: radius,
+        },
+    ]
+}
+
+pub fn warp_dy_to_upright_binary(
+    bin: &BinaryImage,
+    finders: &[DyFinder; 3],
+    target_size: u32,
+) -> BinaryImage {
+    warp_dy_to_upright_binary_with_top_right(bin, finders, None, target_size)
+}
+
+pub fn warp_dy_to_upright_binary_with_top_right(
+    bin: &BinaryImage,
+    finders: &[DyFinder; 3],
+    top_right: Option<(f64, f64)>,
+    target_size: u32,
+) -> BinaryImage {
+    if target_size == 0 {
+        return BinaryImage::new(0, 0, Vec::new());
+    }
+
+    let Some(inv) = dy_upright_to_source_homography(finders, top_right, target_size) else {
+        return BinaryImage::new(
+            target_size,
+            target_size,
+            vec![255; (target_size * target_size) as usize],
+        );
+    };
+
+    let mut data = vec![255; (target_size * target_size) as usize];
+    for y in 0..target_size {
+        for x in 0..target_size {
+            let p = inv * Vector3::new(x as f64, y as f64, 1.0);
+            if p.z.abs() < f64::EPSILON {
+                continue;
+            }
+            let sx = p.x / p.z;
+            let sy = p.y / p.z;
+            let value = bilinear_sample(bin, sx, sy);
+            data[(y * target_size + x) as usize] = if value < 128.0 { 0 } else { 255 };
+        }
+    }
+
+    BinaryImage::new(target_size, target_size, data)
+}
+
+pub fn warp_dy_to_upright_image_with_top_right(
+    image: &DynamicImage,
+    finders: &[DyFinder; 3],
+    top_right: Option<(f64, f64)>,
+    target_size: u32,
+) -> DynamicImage {
+    let size = target_size.max(1);
+    let Some(inv) = dy_upright_to_source_homography(finders, top_right, size) else {
+        return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            size,
+            size,
+            Rgba([255, 255, 255, 255]),
+        ));
+    };
+
+    let source = image.to_rgba8();
+    let mut out = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
+    for y in 0..size {
+        for x in 0..size {
+            let p = inv * Vector3::new(x as f64, y as f64, 1.0);
+            if p.z.abs() < f64::EPSILON {
+                continue;
+            }
+            let sx = p.x / p.z;
+            let sy = p.y / p.z;
+            out.put_pixel(x, y, bilinear_sample_rgba(&source, sx, sy));
+        }
+    }
+
+    DynamicImage::ImageRgba8(out)
+}
+
+pub fn detect_dy_badge_anchor(
+    image: &DynamicImage,
+    finders: &[DyFinder; 3],
+) -> Option<DyBadgeAnchor> {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let bl = &ordered[1];
+    let br = &ordered[2];
+    let expected = (tl.cx + br.cx - bl.cx, tl.cy + br.cy - bl.cy);
+    let center = ((tl.cx + br.cx) * 0.5, (tl.cy + br.cy) * 0.5);
+    let locator_radius = finders.iter().map(DyFinder::outer_radius).sum::<f64>() / 3.0;
+    let locator_distance = finders
+        .iter()
+        .map(|finder| dy_point_distance(center, (finder.cx, finder.cy)))
+        .sum::<f64>()
+        / finders.len() as f64;
+    let r_max = finders
+        .iter()
+        .map(|finder| dy_point_distance(center, (finder.cx, finder.cy)) + finder.outer_radius())
+        .fold(0.0, f64::max)
+        .max(locator_radius * 5.0);
+    let r_min = (r_max * 0.36).max(locator_radius * 2.0);
+    let rgba = image.to_rgba8();
+    let min_dim = rgba.width().min(rgba.height()) as f64;
+    let min_area = (min_dim * 0.045).powi(2) as u32;
+    let mut visited = vec![false; (rgba.width() * rgba.height()) as usize];
+    let mut best: Option<(f64, DyBadgeAnchor)> = None;
+
+    for y in 0..rgba.height() as i32 {
+        for x in 0..rgba.width() as i32 {
+            let idx = (y as u32 * rgba.width() + x as u32) as usize;
+            if visited[idx] || !dy_badge_dark_pixel(rgba.get_pixel(x as u32, y as u32).0) {
+                continue;
+            }
+            let Some(component) = flood_dy_badge_component(&rgba, &mut visited, x, y) else {
+                continue;
+            };
+            if component.area < min_area || !component.is_roundish(min_dim) {
+                continue;
+            }
+            let anchor = component.to_anchor();
+            let distance_to_center = dy_point_distance((anchor.cx, anchor.cy), center);
+            if distance_to_center < r_min || distance_to_center > r_max * 1.25 {
+                continue;
+            }
+            if dy_point_distance((anchor.cx, anchor.cy), expected) > locator_distance * 0.42 {
+                continue;
+            }
+            if anchor.radius < r_max * 0.10 || anchor.radius > r_max * 0.34 {
+                continue;
+            }
+
+            let expected_penalty =
+                dy_point_distance((anchor.cx, anchor.cy), expected) / locator_distance.max(1.0);
+            let score = component.area as f64 * component.shape_score() / (1.0 + expected_penalty);
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score > *best_score)
+            {
+                best = Some((score, anchor));
+            }
+        }
+    }
+
+    best.map(|(_, anchor)| anchor)
+}
+
+pub fn dy_upright_target_finders(finders: &[DyFinder; 3], target_size: u32) -> [DyFinder; 3] {
+    let ordered = order_dy_finders(finders);
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let target_leg = far - margin;
+    let source_leg =
+        (dy_distance(&ordered[0], &ordered[1]) + dy_distance(&ordered[1], &ordered[2])) * 0.5;
+    let scale = if source_leg <= f64::EPSILON {
+        1.0
+    } else {
+        target_leg / source_leg
+    };
+
+    [
+        DyFinder {
+            cx: margin,
+            cy: margin,
+            rings: scaled_dy_rings(&ordered[0], scale),
+        },
+        DyFinder {
+            cx: margin,
+            cy: far,
+            rings: scaled_dy_rings(&ordered[1], scale),
+        },
+        DyFinder {
+            cx: far,
+            cy: far,
+            rings: scaled_dy_rings(&ordered[2], scale),
         },
     ]
 }
@@ -544,6 +730,174 @@ fn wx_upright_to_source_homography(
     ];
     let weights = vec![1.0; src.len()];
     homography_from_points(&src, &dst, &weights)?.try_inverse()
+}
+
+fn dy_upright_to_source_homography(
+    finders: &[DyFinder; 3],
+    top_right: Option<(f64, f64)>,
+    target_size: u32,
+) -> Option<Matrix3<f64>> {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let bl = &ordered[1];
+    let br = &ordered[2];
+    let tr = top_right.unwrap_or((tl.cx + br.cx - bl.cx, tl.cy + br.cy - bl.cy));
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let target_leg = far - margin;
+    let tr_dst = if top_right.is_some() {
+        (
+            far + DY_BADGE_CENTER_DX_PER_LOCATOR_LEG * target_leg,
+            margin + DY_BADGE_CENTER_DY_PER_LOCATOR_LEG * target_leg,
+        )
+    } else {
+        (far, margin)
+    };
+    let src = [(tl.cx, tl.cy), tr, (bl.cx, bl.cy), (br.cx, br.cy)];
+    let dst = [(margin, margin), tr_dst, (margin, far), (far, far)];
+
+    homography_from_4pts(&src, &dst).try_inverse()
+}
+
+fn order_dy_finders(finders: &[DyFinder; 3]) -> [DyFinder; 3] {
+    let distances = [
+        (dy_distance2(&finders[0], &finders[1]), 0_usize, 1_usize),
+        (dy_distance2(&finders[0], &finders[2]), 0, 2),
+        (dy_distance2(&finders[1], &finders[2]), 1, 2),
+    ];
+    let &(_, tl_idx, br_idx) = distances
+        .iter()
+        .max_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0))
+        .expect("three finder distances exist");
+    let bl_idx = 3 - tl_idx - br_idx;
+    let mut tl = finders[tl_idx].clone();
+    let mut br = finders[br_idx].clone();
+    let bl = finders[bl_idx].clone();
+
+    if tl.cy > br.cy {
+        std::mem::swap(&mut tl, &mut br);
+    }
+
+    [tl, bl, br]
+}
+
+fn scaled_dy_rings(finder: &DyFinder, scale: f64) -> Vec<f64> {
+    let rings: Vec<f64> = finder
+        .rings
+        .iter()
+        .map(|radius| (radius * scale).max(1.0))
+        .collect();
+    if rings.is_empty() { vec![1.0] } else { rings }
+}
+
+fn dy_distance(a: &DyFinder, b: &DyFinder) -> f64 {
+    dy_distance2(a, b).sqrt()
+}
+
+fn dy_point_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+fn dy_distance2(a: &DyFinder, b: &DyFinder) -> f64 {
+    let dx = a.cx - b.cx;
+    let dy = a.cy - b.cy;
+    dx * dx + dy * dy
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DyBadgeComponent {
+    area: u32,
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+}
+
+impl DyBadgeComponent {
+    fn width(self) -> f64 {
+        (self.max_x - self.min_x + 1) as f64
+    }
+
+    fn height(self) -> f64 {
+        (self.max_y - self.min_y + 1) as f64
+    }
+
+    fn is_roundish(self, min_dim: f64) -> bool {
+        if self.width() < min_dim * 0.08 || self.height() < min_dim * 0.08 {
+            return false;
+        }
+        let aspect = self.width() / self.height().max(1.0);
+        if !(0.70..=1.35).contains(&aspect) {
+            return false;
+        }
+        let ellipse_area = std::f64::consts::PI * self.width() * self.height() * 0.25;
+        let fill = self.area as f64 / ellipse_area.max(1.0);
+        (0.22..=1.30).contains(&fill)
+    }
+
+    fn shape_score(self) -> f64 {
+        let aspect = self.width() / self.height().max(1.0);
+        1.0 / (1.0 + (aspect - 1.0).abs())
+    }
+
+    fn to_anchor(self) -> DyBadgeAnchor {
+        DyBadgeAnchor {
+            cx: (self.min_x + self.max_x) as f64 * 0.5,
+            cy: (self.min_y + self.max_y) as f64 * 0.5,
+            radius: (self.width() + self.height()) * 0.25,
+        }
+    }
+}
+
+fn flood_dy_badge_component(
+    image: &RgbaImage,
+    visited: &mut [bool],
+    start_x: i32,
+    start_y: i32,
+) -> Option<DyBadgeComponent> {
+    let mut stack = vec![(start_x, start_y)];
+    let mut area = 0_u32;
+    let mut min_x = start_x;
+    let mut max_x = start_x;
+    let mut min_y = start_y;
+    let mut max_y = start_y;
+
+    while let Some((x, y)) = stack.pop() {
+        if x < 0 || y < 0 || x >= image.width() as i32 || y >= image.height() as i32 {
+            continue;
+        }
+        let idx = (y as u32 * image.width() + x as u32) as usize;
+        if visited[idx] || !dy_badge_dark_pixel(image.get_pixel(x as u32, y as u32).0) {
+            continue;
+        }
+
+        visited[idx] = true;
+        area += 1;
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+
+        stack.push((x - 1, y));
+        stack.push((x + 1, y));
+        stack.push((x, y - 1));
+        stack.push((x, y + 1));
+    }
+
+    (area > 0).then_some(DyBadgeComponent {
+        area,
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    })
+}
+
+fn dy_badge_dark_pixel(pixel: [u8; 4]) -> bool {
+    let [r, g, b, a] = pixel;
+    let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+    a > 128 && luma < 96.0
 }
 
 fn homography_from_points(
@@ -921,6 +1275,57 @@ mod tests {
     }
 
     #[test]
+    fn warp_rotated_douyin_finders_to_upright_targets() {
+        let mut bin = BinaryImage::new(420, 420, vec![255; 420 * 420]);
+        let angle = 6.0_f64.to_radians();
+        let center = (210.0, 210.0);
+        let rotate = |x: f64, y: f64| {
+            let dx = x - center.0;
+            let dy = y - center.1;
+            (
+                center.0 + dx * angle.cos() - dy * angle.sin(),
+                center.1 + dx * angle.sin() + dy * angle.cos(),
+            )
+        };
+        let points = [
+            rotate(110.0, 110.0),
+            rotate(110.0, 310.0),
+            rotate(310.0, 310.0),
+        ];
+        for &(cx, cy) in &points {
+            draw_disk(&mut bin, cx, cy, 12.0);
+        }
+        let finders = [
+            DyFinder {
+                cx: points[0].0,
+                cy: points[0].1,
+                rings: vec![4.0, 12.0],
+            },
+            DyFinder {
+                cx: points[1].0,
+                cy: points[1].1,
+                rings: vec![4.0, 12.0],
+            },
+            DyFinder {
+                cx: points[2].0,
+                cy: points[2].1,
+                rings: vec![4.0, 12.0],
+            },
+        ];
+
+        let warped = warp_dy_to_upright_binary(&bin, &finders, 360);
+        let target = dy_upright_target_finders(&finders, 360);
+
+        for finder in &target {
+            assert!(warped.is_black(finder.cx.round() as i32, finder.cy.round() as i32));
+        }
+        assert!(
+            (target[0].cx - target[1].cx).abs() < 1e-6
+                && (target[1].cy - target[2].cy).abs() < 1e-6
+        );
+    }
+
+    #[test]
     fn detected_finders_warp_synthetic_qr_to_module_grid() {
         let qr = QrCode::encode_text("https://example.com/qracer", QrCodeEcc::Medium).unwrap();
         let scale = 6;
@@ -1068,6 +1473,24 @@ mod tests {
         }
 
         BinaryImage::new(image_size, image_size, data)
+    }
+
+    fn draw_disk(bin: &mut BinaryImage, cx: f64, cy: f64, radius: f64) {
+        let min_x = (cx - radius).floor().max(0.0) as i32;
+        let max_x = (cx + radius).ceil().min(bin.w as f64 - 1.0) as i32;
+        let min_y = (cy - radius).floor().max(0.0) as i32;
+        let max_y = (cy + radius).ceil().min(bin.h as f64 - 1.0) as i32;
+        let radius2 = radius * radius;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let dx = x as f64 + 0.5 - cx;
+                let dy = y as f64 + 0.5 - cy;
+                if dx * dx + dy * dy <= radius2 {
+                    bin.data[(y as u32 * bin.w + x as u32) as usize] = 0;
+                }
+            }
+        }
     }
 
     fn warp_source_square_to_canvas(

@@ -12,15 +12,16 @@ use crate::codec::qr::{QrDecoded, QrMatrix, decode_qr, regenerate_qr};
 use crate::codec::qr_grid::{infer_qr_version, sample_qr_grid};
 use crate::codec::wx_grid::{WxGrid, detect_wx_version, sample_wx, sample_wx_with_badge};
 use crate::detect;
-use crate::detect::finder_dy::{find_dy_finders, select_dy_finders};
+use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
 use crate::detect::finder_qr::{QrFinder, find_qr_finders, select_qr_finder_triplet};
 use crate::detect::finder_wx::{
     find_wx_finders, select_wx_finders_raw, select_wx_finders_raw_with_badge,
 };
 use crate::image_io;
 use crate::pipeline::perspective::{
-    WxUprightAnchor, detect_wx_badge_anchor, warp_qr_to_square_image, warp_wx_to_upright_binary,
-    warp_wx_to_upright_image, wx_upright_target_finders,
+    WxUprightAnchor, detect_dy_badge_anchor, detect_wx_badge_anchor, dy_upright_target_finders,
+    warp_dy_to_upright_binary, warp_dy_to_upright_image_with_top_right, warp_qr_to_square_image,
+    warp_wx_to_upright_binary, warp_wx_to_upright_image, wx_upright_target_finders,
 };
 use crate::pipeline::preprocess::{BinaryImage, preprocess};
 use crate::screen_capture;
@@ -542,7 +543,7 @@ impl QRacerApp {
 
     fn process_dy(&mut self, binary: &BinaryImage, source: Option<&DynamicImage>) {
         let finders = find_dy_finders(binary);
-        let Some(selected) = select_dy_finders(&finders) else {
+        let Some(raw_selected) = select_dy_finders_raw(&finders) else {
             self.status = format!(
                 "已识别抖音码，但无法从 {} 个候选中选出三同心圆定位点",
                 finders.len()
@@ -550,16 +551,38 @@ impl QRacerApp {
             return;
         };
 
-        let params = match detect_dy_params(binary, &selected) {
+        let correction_size = source
+            .map(|source| source.width().max(source.height()))
+            .unwrap_or_else(|| binary.w.max(binary.h))
+            .clamp(PREVIEW_SIZE, 1600);
+        let top_right = source
+            .and_then(|source| detect_dy_badge_anchor(source, &raw_selected))
+            .map(|badge| (badge.cx, badge.cy));
+        let corrected_source = source.map(|source| {
+            warp_dy_to_upright_image_with_top_right(
+                source,
+                &raw_selected,
+                top_right,
+                correction_size,
+            )
+        });
+        let corrected_binary = corrected_source
+            .as_ref()
+            .map(preprocess)
+            .unwrap_or_else(|| warp_dy_to_upright_binary(binary, &raw_selected, correction_size));
+        let selected = dy_upright_target_finders(&raw_selected, correction_size);
+        self.warped = Some(corrected_binary.clone());
+
+        let params = match detect_dy_params(&corrected_binary, &selected) {
             Ok(params) => params,
             Err(error) => {
                 self.status = format!("抖音码参数检测失败：{error}");
                 return;
             }
         };
-        let sampled = match source {
-            Some(source) => sample_dy_with_logos(binary, source, &selected, params),
-            None => sample_dy(binary, &selected, params),
+        let sampled = match corrected_source.as_ref() {
+            Some(source) => sample_dy_with_logos(&corrected_binary, source, &selected, params),
+            None => sample_dy(&corrected_binary, &selected, params),
         };
 
         match sampled {
@@ -676,7 +699,7 @@ impl QRacerApp {
         ));
         self.last_diff_count = Some(diff_count);
         self.status = format!(
-            "已识别抖音码：{} 环，每环 {} 点，{}；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+            "已识别抖音码：{} 环，编码每环 {} 点，{}；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
             grid.ring_count(),
             grid.points_per_ring,
             if grid.has_border {
@@ -1028,7 +1051,7 @@ fn process_dy_image(
     result: &mut ProcessResult,
 ) {
     let finders = find_dy_finders(binary);
-    let Some(selected) = select_dy_finders(&finders) else {
+    let Some(raw_selected) = select_dy_finders_raw(&finders) else {
         result.status = format!(
             "已识别抖音码，但无法从 {} 个候选中选出三同心圆定位点",
             finders.len()
@@ -1036,7 +1059,15 @@ fn process_dy_image(
         return;
     };
 
-    let params = match detect_dy_params(binary, &selected) {
+    let correction_size = img.width().max(img.height()).clamp(PREVIEW_SIZE, 1600);
+    let top_right = detect_dy_badge_anchor(img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+    let corrected_source =
+        warp_dy_to_upright_image_with_top_right(img, &raw_selected, top_right, correction_size);
+    let corrected_binary = preprocess(&corrected_source);
+    let selected = dy_upright_target_finders(&raw_selected, correction_size);
+    result.warped = Some(corrected_binary.clone());
+
+    let params = match detect_dy_params(&corrected_binary, &selected) {
         Ok(params) => params,
         Err(error) => {
             result.status = format!("抖音码参数检测失败：{error}");
@@ -1044,11 +1075,15 @@ fn process_dy_image(
         }
     };
 
-    match sample_dy_with_logos(binary, img, &selected, params) {
+    match sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params) {
         Ok(grid) => {
             let svg = dy_grid_to_svg(&grid);
-            let (preview, diff_count) =
-                dy_grid_to_diff_preview_image(&grid, binary, show_diff_overlay, PREVIEW_SIZE);
+            let (preview, diff_count) = dy_grid_to_diff_preview_image(
+                &grid,
+                &corrected_binary,
+                show_diff_overlay,
+                PREVIEW_SIZE,
+            );
             result.last_dy_grid = Some(grid.clone());
             result.last_svg = Some(svg);
             result.last_diff_count = Some(diff_count);
@@ -1061,7 +1096,7 @@ fn process_dy_image(
                 preview,
             ));
             result.status = format!(
-                "已识别抖音码：{} 环，每环 {} 点，{}；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+                "已识别抖音码：{} 环，编码每环 {} 点，{}；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
                 grid.ring_count(),
                 grid.points_per_ring,
                 if grid.has_border {

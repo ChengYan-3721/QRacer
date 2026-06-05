@@ -28,7 +28,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
 
         if let Some(grid) = app.last_dy_grid.as_ref() {
             ui.label(format!(
-                "{} 环 / 每环 {} 点 / {}",
+                "{} 环 / 编码每环 {} 点 / {}",
                 grid.ring_count(),
                 grid.points_per_ring,
                 if grid.has_border {
