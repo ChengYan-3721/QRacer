@@ -20,11 +20,20 @@ pub fn detect_kind_with_image(image: &DynamicImage, bin: &BinaryImage) -> CodeKi
 fn detect_kind_impl(bin: &BinaryImage, hints: DetectionHints) -> CodeKind {
     let signature = polar_signature(bin);
     let qr_finders = finder_qr::find_qr_finders(bin);
-    let has_qr = finder_qr::select_qr_finder_triplet(bin, &qr_finders).is_some();
+    let qr_triplet = finder_qr::select_qr_finder_triplet(bin, &qr_finders);
+    let has_qr = qr_triplet.is_some();
+    let has_qr_lattice = qr_triplet
+        .as_ref()
+        .and_then(|triplet| finder_qr::qr_lattice_signature(bin, triplet))
+        .is_some_and(finder_qr::QrLatticeSignature::is_confident);
     let wx_finders = finder_wx::find_wx_finders(bin);
     let has_wx = finder_wx::select_wx_finders(&wx_finders).is_some();
     let dy_finders = finder_dy::find_dy_finders(bin);
     let has_dy = finder_dy::select_dy_finders(&dy_finders).is_some();
+
+    if has_qr_lattice {
+        return CodeKind::Qr;
+    }
 
     let circular_kind = choose_circular_kind(has_wx, has_dy, signature, hints);
     if let Some(kind) = circular_kind
@@ -70,6 +79,12 @@ fn choose_circular_kind(
 ) -> Option<CodeKind> {
     if !has_wx && !has_dy {
         return None;
+    }
+    if has_wx
+        && has_dy
+        && signature.is_some_and(|signature| signature.tangential > signature.radial + 0.10)
+    {
+        return Some(CodeKind::Douyin);
     }
     if has_wx && hints.wx_badge {
         return Some(CodeKind::WxMiniprogram);
@@ -366,6 +381,36 @@ mod tests {
         let bin = render_qr_binary(&qr, 5, 4);
 
         assert_eq!(detect_kind(&bin), CodeKind::Qr);
+    }
+
+    #[test]
+    fn detect_kind_returns_qr_for_styled_qr_samples() {
+        let mut failures = Vec::new();
+
+        for path in sample_paths(&["微信样式", "小红书样式", "小红书QR码"]) {
+            let img = image::open(&path).unwrap();
+            let bin = crate::pipeline::preprocess::preprocess(&img);
+            let hints = DetectionHints::from_image(&img);
+            let signature = polar_signature(&bin);
+            let qr_triplet =
+                finder_qr::select_qr_finder_triplet(&bin, &finder_qr::find_qr_finders(&bin));
+            let qr_lattice = qr_triplet
+                .as_ref()
+                .and_then(|triplet| finder_qr::qr_lattice_signature(&bin, triplet));
+            let has_qr = qr_triplet.is_some();
+            let has_wx = finder_wx::select_wx_finders(&finder_wx::find_wx_finders(&bin)).is_some();
+            let has_dy = finder_dy::select_dy_finders(&finder_dy::find_dy_finders(&bin)).is_some();
+
+            let actual = detect_kind_with_image(&img, &bin);
+            if actual != CodeKind::Qr {
+                failures.push(format!(
+                    "{} actual={actual:?} signature={signature:?} qr_lattice={qr_lattice:?} hints={hints:?} qr={has_qr} wx={has_wx} dy={has_dy}",
+                    path.display(),
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

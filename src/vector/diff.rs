@@ -1,5 +1,7 @@
+#[cfg(test)]
 use std::collections::HashSet;
 
+#[cfg(test)]
 use image::{DynamicImage, Rgba, RgbaImage};
 
 use crate::codec::qr::QrMatrix;
@@ -53,6 +55,7 @@ fn is_square_matrix(matrix: &QrMatrix, modules: usize) -> bool {
     matrix.len() == modules && matrix.iter().all(|row| row.len() == modules)
 }
 
+#[cfg(test)]
 pub fn render_qr_diff_preview(
     matrix: &QrMatrix,
     diff: Option<&DiffResult>,

@@ -30,6 +30,7 @@ pub fn read_clipboard_image() -> Result<DynamicImage> {
 pub fn open_image_dialog() -> Result<Option<DynamicImage>> {
     let file = rfd::FileDialog::new()
         .add_filter("图像", &["png", "jpg", "jpeg", "bmp", "webp"])
+        .add_filter("所有文件", &["*"])
         .set_title("选择二维码 / 小程序码 / 抖音码截图")
         .pick_file();
 
@@ -42,7 +43,19 @@ pub fn open_image_dialog() -> Result<Option<DynamicImage>> {
 }
 
 fn load_image_from_path(path: &Path) -> Result<DynamicImage> {
-    image::open(path).with_context(|| format!("无法打开图像文件：{}", path.display()))
+    let bytes =
+        std::fs::read(path).with_context(|| format!("无法读取图像文件：{}", path.display()))?;
+
+    match image::load_from_memory(&bytes) {
+        Ok(img) => Ok(img),
+        Err(content_error) => image::open(path).with_context(|| {
+            format!(
+                "无法打开图像文件：{}（按文件头识别失败：{}）",
+                path.display(),
+                content_error
+            )
+        }),
+    }
 }
 
 /// 把 image::DynamicImage 转为 egui::ColorImage（egui 的 CPU 端图像表示）。
@@ -53,4 +66,40 @@ pub fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, ImageFormat, Rgba};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn load_image_from_path_uses_file_header_before_extension() {
+        let path = temp_image_path("jpg");
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_fn(3, 2, |x, y| {
+            Rgba([(x * 40) as u8, (y * 80) as u8, 128, 255])
+        }));
+        image
+            .save_with_format(&path, ImageFormat::Png)
+            .expect("png test image should save with mismatched extension");
+
+        let loaded = load_image_from_path(&path).expect("image should load from file header");
+
+        assert_eq!(loaded.width(), 3);
+        assert_eq!(loaded.height(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn temp_image_path(extension: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "qracer-mismatched-image-{}-{nanos}.{extension}",
+            std::process::id()
+        ))
+    }
 }

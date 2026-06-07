@@ -4,6 +4,7 @@
 // 阶段 3+ 后右侧会被真实生成的矢量光栅化结果替代。
 
 use crate::app::{LoadedImage, QRacerApp};
+use crate::vector::svg::QrAppearance;
 use eframe::egui;
 
 pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
@@ -19,14 +20,34 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
         ui.separator();
 
         ui.allocate_ui(egui::vec2(pane_w, available.y), |ui| {
-            pane(
-                ui,
-                ctx,
-                "校正预览",
-                app.preview.as_mut(),
-                loading_message.as_deref(),
-            );
+            preview_pane(ui, ctx, app, loading_message.as_deref());
         });
+    });
+}
+
+fn preview_pane(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    app: &mut QRacerApp,
+    loading_message: Option<&str>,
+) {
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("校正预览").heading());
+            if app.can_switch_qr_appearance() {
+                ui.add_space(8.0);
+                for appearance in QrAppearance::ALL {
+                    if ui
+                        .selectable_label(app.qr_appearance == appearance, appearance.label())
+                        .clicked()
+                    {
+                        app.set_qr_appearance(appearance);
+                    }
+                }
+            }
+        });
+        ui.separator();
+        pane_body(ui, ctx, app.preview.as_mut(), loading_message);
     });
 }
 
@@ -40,35 +61,43 @@ fn pane(
     ui.vertical(|ui| {
         ui.label(egui::RichText::new(title).heading());
         ui.separator();
-
-        match image {
-            Some(img) => {
-                let tex = img.texture(ctx);
-                // 按可用空间等比缩放显示，并在面板内居中。
-                let size = tex.size_vec2();
-                let max = ui.available_size();
-                let scale = (max.x / size.x).min(max.y / size.y).min(1.0);
-                let display = size * scale;
-                let (rect, _) = ui.allocate_exact_size(max, egui::Sense::hover());
-                let image_rect = egui::Align2::CENTER_CENTER.align_size_within_rect(display, rect);
-                ui.put(
-                    image_rect,
-                    egui::Image::from_texture(tex).fit_to_exact_size(display),
-                );
-            }
-            None => {
-                ui.centered_and_justified(|ui| {
-                    if let Some(message) = loading_message {
-                        ui.vertical_centered(|ui| {
-                            ui.spinner();
-                            ui.add_space(8.0);
-                            ui.label(message);
-                        });
-                    } else {
-                        ui.label(egui::RichText::new("（无图像）").color(egui::Color32::DARK_GRAY));
-                    }
-                });
-            }
-        }
+        pane_body(ui, ctx, image, loading_message);
     });
+}
+
+fn pane_body(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    image: Option<&mut LoadedImage>,
+    loading_message: Option<&str>,
+) {
+    match image {
+        Some(img) => {
+            let tex = img.texture(ctx);
+            // 按可用空间等比缩放显示，并在面板内居中。
+            let size = tex.size_vec2();
+            let max = ui.available_size();
+            let scale = (max.x / size.x).min(max.y / size.y).min(1.0);
+            let display = size * scale;
+            let (rect, _) = ui.allocate_exact_size(max, egui::Sense::hover());
+            let image_rect = egui::Align2::CENTER_CENTER.align_size_within_rect(display, rect);
+            ui.put(
+                image_rect,
+                egui::Image::from_texture(tex).fit_to_exact_size(display),
+            );
+        }
+        None => {
+            ui.centered_and_justified(|ui| {
+                if let Some(message) = loading_message {
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(message);
+                    });
+                } else {
+                    ui.label(egui::RichText::new("（无图像）").color(egui::Color32::DARK_GRAY));
+                }
+            });
+        }
+    }
 }

@@ -2,8 +2,10 @@ use crate::codec::dy_grid::{DyBadgeStyle, DyGrid, RingSpec};
 use crate::codec::qr::QrMatrix;
 use crate::codec::wx_grid::WxGrid;
 use crate::pipeline::preprocess::BinaryImage;
+use crate::vector::diff::DiffResult;
 use crate::vector::shapes::polar_sector_path;
 use image::{DynamicImage, Rgba, RgbaImage};
+use std::collections::HashSet;
 
 const DOUYIN_BLACK_FILL: &str = "#000";
 
@@ -41,6 +43,57 @@ const DOUYIN_BULLSEYE_BADGE_PATHS: &[&str] = &[
 ];
 const DOUYIN_BLACK_BORDER_LOCATOR_DISTANCE: f64 = 261.452;
 const DOUYIN_BLACK_BORDER_BADGE_OUTER_RADIUS_SCALE: f64 = 1.17;
+const DOUYIN_NO_BORDER_LOCATOR_DISTANCE: f64 = 240.529442688416;
+// Cell centers land at 1 deg + n * 3 deg in the standard no-border SVG.
+const DOUYIN_NO_BORDER_CODE_THETA_OFFSET: f64 = -0.5 * std::f64::consts::PI / 180.0;
+const DOUYIN_NO_BORDER_CODE_RUN_WIDTH_SCALE: f64 = 1.00;
+const DOUYIN_NO_BORDER_DECORATIVE_RUN_WIDTH_SCALE: f64 = 1.30;
+const DOUYIN_NO_BORDER_LOGO_PATH: &str = "M504.41,111.46c-5.6-.45-10.01-5.14-10.01-10.85h0s-10.07,0-10.07,0h0s-1.07,0-1.07,0v34.03c0,3.43-2.78,6.22-6.22,6.22s-6.22-2.78-6.22-6.22,2.78-6.22,6.22-6.22c.21,0,.42.01.63.03v-10.07c-.21,0-.42-.03-.63-.03-8.99,0-16.29,7.29-16.29,16.29s7.29,16.29,16.29,16.29,16.29-7.29,16.29-16.29v-16.86c3.17,2.21,6.97,3.57,11.08,3.75v-10.07Z";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrAppearance {
+    Standard,
+    Wechat,
+    Xiaohongshu,
+}
+
+impl QrAppearance {
+    pub const ALL: [Self; 3] = [Self::Standard, Self::Wechat, Self::Xiaohongshu];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "标准",
+            Self::Wechat => "微信样式",
+            Self::Xiaohongshu => "小红书样式",
+        }
+    }
+}
+
+const WECHAT_LOGO_REFERENCE_CENTER: (f64, f64) = (57.10, 57.27);
+const WECHAT_LOGO_REFERENCE_BADGE_SIZE: f64 = 25.70;
+const WECHAT_DATA_SIDE_RATIO: f64 = 0.766_784_452_296_819_8;
+const WECHAT_DATA_RADIUS_RATIO: f64 = 0.123_674_911_660_777_39;
+const WECHAT_FINDER_OFFSET_RATIO: f64 = -0.106_007_067_137_809_19;
+const WECHAT_FINDER_OUTER_SIZE_RATIO: f64 = 7.003_533_568_904_593;
+const WECHAT_FINDER_OUTER_RADIUS_RATIO: f64 = 0.713_780_918_727_915_2;
+const WECHAT_FINDER_HOLE_OFFSET_RATIO: f64 = 0.858_657_243_816_254_5;
+const WECHAT_FINDER_HOLE_SIZE_RATIO: f64 = 5.070_671_378_091_873;
+const WECHAT_FINDER_HOLE_RADIUS_RATIO: f64 = 0.363_957_597_173_144_9;
+const WECHAT_FINDER_INNER_OFFSET_RATIO: f64 = 1.886_925_795_053_003_5;
+const WECHAT_FINDER_INNER_SIZE_RATIO: f64 = 3.014_134_275_618_375;
+const WECHAT_FINDER_INNER_RADIUS_RATIO: f64 = 0.392_226_148_409_893_94;
+const WECHAT_BADGE_WHITE_SIZE_QR_RATIO: f64 = 0.297_774_806_608_729;
+const WECHAT_BADGE_WHITE_CENTER_OFFSET_MODULES: f64 = 0.030_035_335_689_043_7;
+const WECHAT_LOGO_SIZE_QR_RATIO: f64 = 0.245_439_786_075_828;
+const WECHAT_LOGO_CENTER_OFFSET_X_MODULES: f64 = -0.083_038_869_257_952_8;
+const WECHAT_LOGO_CENTER_OFFSET_Y_MODULES: f64 = -0.079_505_300_353_357_4;
+const WECHAT_LOGO_PATHS: &[&str] = &[
+    "M58.79,57.43c-.34,0-.61.27-.61.61s.27.61.61.61.61-.27.61-.61-.27-.61-.61-.61Z",
+    "M52.58,53c-.4,0-.73.33-.73.73s.33.73.73.73.73-.33.73-.73-.33-.73-.73-.73Z",
+    "M56.79,54.46c.4,0,.73-.33.73-.73s-.33-.73-.73-.73-.73.33-.73.73.33.73.73.73Z",
+    "M66.85,44.42h-19.5c-1.71,0-3.1,1.39-3.1,3.1v19.5c0,1.71,1.39,3.1,3.1,3.1h19.5c1.71,0,3.1-1.39,3.1-3.1v-19.5c0-1.71-1.39-3.1-3.1-3.1ZM54.66,60.75c-.79,0-1.54-.13-2.23-.35l-2.08,1.19.36-2.03c-1.42-.98-2.32-2.47-2.32-4.14,0-2.94,2.81-5.33,6.28-5.33,3.15,0,5.74,1.97,6.2,4.53-.11,0-.22-.01-.33-.01-3.15,0-5.7,2.17-5.7,4.84,0,.45.08.87.21,1.28-.12,0-.25.02-.37.02ZM63.91,62.82l.19,1.81-1.6-1.07c-.61.21-1.28.33-1.98.33-2.89,0-5.24-1.99-5.24-4.45s2.35-4.45,5.24-4.45,5.24,1.99,5.24,4.45c0,1.36-.73,2.55-1.86,3.37Z",
+    "M62.3,57.43c-.34,0-.61.27-.61.61s.27.61.61.61.61-.27.61-.61-.27-.61-.61-.61Z",
+];
 
 #[derive(Debug, Clone, Copy)]
 enum DouyinBlackBorderStaticMarks {
@@ -64,6 +117,25 @@ struct DouyinBlackBorderLayout {
     static_marks: DouyinBlackBorderStaticMarks,
     badge: DouyinBlackBorderBadgeGeometry,
     locators: [(f64, f64); 3],
+    black_fill: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DouyinNoBorderBadgeGeometry {
+    cx: f64,
+    cy: f64,
+    outer_radius: f64,
+    inner_radius: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DouyinNoBorderLayout {
+    viewbox: (f64, f64),
+    center: (f64, f64),
+    code_theta_offset: f64,
+    badge: DouyinNoBorderBadgeGeometry,
+    locators: [(f64, f64); 3],
+    locator_radii: (f64, f64, f64),
     black_fill: &'static str,
 }
 
@@ -113,7 +185,39 @@ const DOUYIN_BLACK_BORDER_BULLSEYE_BADGE_LAYOUT: DouyinBlackBorderLayout =
         black_fill: DOUYIN_BLACK_FILL,
     };
 
+const DOUYIN_NO_BORDER_LAYOUT: DouyinNoBorderLayout = DouyinNoBorderLayout {
+    viewbox: (607.34, 615.94),
+    center: (304.32, 307.63),
+    code_theta_offset: DOUYIN_NO_BORDER_CODE_THETA_OFFSET,
+    badge: DouyinNoBorderBadgeGeometry {
+        cx: 483.49,
+        cy: 128.31,
+        outer_radius: 58.02,
+        inner_radius: 47.34,
+    },
+    locators: [(134.24, 137.55), (134.24, 477.71), (474.40, 477.71)],
+    locator_radii: (29.01, 18.43, 8.13),
+    black_fill: DOUYIN_BLACK_FILL,
+};
+
 pub fn qr_matrix_to_svg(matrix: &QrMatrix, module_mm: f64) -> String {
+    qr_matrix_to_svg_with_appearance(matrix, module_mm, QrAppearance::Standard)
+}
+
+pub fn qr_matrix_to_svg_with_appearance(
+    matrix: &QrMatrix,
+    module_mm: f64,
+    appearance: QrAppearance,
+) -> String {
+    match appearance {
+        QrAppearance::Standard => qr_matrix_to_standard_svg(matrix, module_mm),
+        QrAppearance::Wechat | QrAppearance::Xiaohongshu => {
+            qr_matrix_to_styled_svg(matrix, module_mm, appearance)
+        }
+    }
+}
+
+fn qr_matrix_to_standard_svg(matrix: &QrMatrix, module_mm: f64) -> String {
     let size = matrix.len();
     let module_mm = module_mm.max(0.01);
     let canvas = size as f64 * module_mm;
@@ -127,8 +231,8 @@ pub fn qr_matrix_to_svg(matrix: &QrMatrix, module_mm: f64) -> String {
     ));
 
     for (y, row) in matrix.iter().enumerate() {
-        for (x, &is_black) in row.iter().enumerate() {
-            if is_black {
+        for (x, _) in row.iter().enumerate() {
+            if standard_qr_module_is_black(matrix, size, x, y) {
                 let px = x as f64 * module_mm;
                 let py = y as f64 * module_mm;
                 svg.push_str(&format!(
@@ -140,6 +244,429 @@ pub fn qr_matrix_to_svg(matrix: &QrMatrix, module_mm: f64) -> String {
 
     svg.push_str("</svg>");
     svg
+}
+
+fn qr_matrix_to_styled_svg(matrix: &QrMatrix, module_mm: f64, appearance: QrAppearance) -> String {
+    let size = matrix.len();
+    let module_mm = module_mm.max(0.01);
+    let canvas = size as f64 * module_mm;
+    let view_min = if appearance == QrAppearance::Wechat {
+        module_mm * WECHAT_FINDER_OFFSET_RATIO
+    } else {
+        0.0
+    };
+    let view_size = canvas - view_min;
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{view_size:.3}mm" height="{view_size:.3}mm" viewBox="{view_min:.3} {view_min:.3} {view_size:.3} {view_size:.3}" shape-rendering="geometricPrecision">"#
+    ));
+    svg.push_str(&format!(
+        r##"<rect x="{view_min:.3}" y="{view_min:.3}" width="{view_size:.3}" height="{view_size:.3}" fill="#fff"/>"##
+    ));
+
+    for (y, row) in matrix.iter().enumerate() {
+        for (x, &is_black) in row.iter().enumerate() {
+            if !is_black || is_qr_finder_area(size, x, y) {
+                continue;
+            }
+            push_qr_styled_module(&mut svg, x, y, module_mm, appearance);
+        }
+    }
+
+    if size >= 7 {
+        for (x, y) in qr_finder_origins(size) {
+            match appearance {
+                QrAppearance::Wechat => push_wechat_qr_finder(
+                    &mut svg,
+                    x as f64 * module_mm,
+                    y as f64 * module_mm,
+                    module_mm,
+                ),
+                QrAppearance::Xiaohongshu => push_xiaohongshu_qr_finder(
+                    &mut svg,
+                    x as f64 * module_mm,
+                    y as f64 * module_mm,
+                    module_mm,
+                ),
+                QrAppearance::Standard => {}
+            }
+        }
+    }
+
+    if appearance == QrAppearance::Wechat && size >= 21 {
+        push_wechat_qr_badge(&mut svg, size as f64 * module_mm, module_mm);
+    }
+
+    svg.push_str("</svg>");
+    svg
+}
+
+fn push_qr_styled_module(
+    svg: &mut String,
+    x: usize,
+    y: usize,
+    module: f64,
+    appearance: QrAppearance,
+) {
+    let cx = (x as f64 + 0.5) * module;
+    let cy = (y as f64 + 0.5) * module;
+    match appearance {
+        QrAppearance::Wechat => {
+            let side = module * WECHAT_DATA_SIDE_RATIO;
+            let radius = module * WECHAT_DATA_RADIUS_RATIO;
+            svg.push_str(&format!(
+                r##"<rect x="{:.3}" y="{:.3}" width="{side:.3}" height="{side:.3}" rx="{radius:.3}" ry="{radius:.3}" fill="#000"/>"##,
+                cx - side * 0.5,
+                cy - side * 0.5,
+            ));
+        }
+        QrAppearance::Xiaohongshu => {
+            let radius = module * 0.31;
+            svg.push_str(&format!(
+                r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{radius:.3}" fill="#000"/>"##
+            ));
+        }
+        QrAppearance::Standard => {}
+    }
+}
+
+fn push_wechat_qr_finder(svg: &mut String, x: f64, y: f64, module: f64) {
+    let outer_x = x + module * WECHAT_FINDER_OFFSET_RATIO;
+    let outer_y = y + module * WECHAT_FINDER_OFFSET_RATIO;
+    let outer = module * WECHAT_FINDER_OUTER_SIZE_RATIO;
+    let outer_radius = module * WECHAT_FINDER_OUTER_RADIUS_RATIO;
+    svg.push_str(&format!(
+        r##"<rect x="{outer_x:.3}" y="{outer_y:.3}" width="{outer:.3}" height="{outer:.3}" rx="{outer_radius:.3}" ry="{outer_radius:.3}" fill="#000"/>"##
+    ));
+    svg.push_str(&format!(
+        r##"<rect x="{:.3}" y="{:.3}" width="{:.3}" height="{:.3}" rx="{:.3}" ry="{:.3}" fill="#fff"/>"##,
+        x + module * WECHAT_FINDER_HOLE_OFFSET_RATIO,
+        y + module * WECHAT_FINDER_HOLE_OFFSET_RATIO,
+        module * WECHAT_FINDER_HOLE_SIZE_RATIO,
+        module * WECHAT_FINDER_HOLE_SIZE_RATIO,
+        module * WECHAT_FINDER_HOLE_RADIUS_RATIO,
+        module * WECHAT_FINDER_HOLE_RADIUS_RATIO,
+    ));
+    svg.push_str(&format!(
+        r##"<rect x="{:.3}" y="{:.3}" width="{:.3}" height="{:.3}" rx="{:.3}" ry="{:.3}" fill="#000"/>"##,
+        x + module * WECHAT_FINDER_INNER_OFFSET_RATIO,
+        y + module * WECHAT_FINDER_INNER_OFFSET_RATIO,
+        module * WECHAT_FINDER_INNER_SIZE_RATIO,
+        module * WECHAT_FINDER_INNER_SIZE_RATIO,
+        module * WECHAT_FINDER_INNER_RADIUS_RATIO,
+        module * WECHAT_FINDER_INNER_RADIUS_RATIO,
+    ));
+}
+
+fn push_xiaohongshu_qr_finder(svg: &mut String, x: f64, y: f64, module: f64) {
+    let cx = x + module * 3.5;
+    let cy = y + module * 3.5;
+    svg.push_str(&format!(
+        r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#000"/>"##,
+        module * 3.50,
+    ));
+    svg.push_str(&format!(
+        r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#fff"/>"##,
+        module * 2.50,
+    ));
+    svg.push_str(&format!(
+        r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#000"/>"##,
+        module * 1.50,
+    ));
+}
+
+fn push_wechat_qr_badge(svg: &mut String, canvas: f64, module: f64) {
+    let center = canvas * 0.5;
+    let white_center = center + module * WECHAT_BADGE_WHITE_CENTER_OFFSET_MODULES;
+    let logo_center_x = center + module * WECHAT_LOGO_CENTER_OFFSET_X_MODULES;
+    let logo_center_y = center + module * WECHAT_LOGO_CENTER_OFFSET_Y_MODULES;
+    let white_size = canvas * WECHAT_BADGE_WHITE_SIZE_QR_RATIO;
+    let black_size = canvas * WECHAT_LOGO_SIZE_QR_RATIO;
+    svg.push_str(&format!(
+        r##"<rect x="{:.3}" y="{:.3}" width="{white_size:.3}" height="{white_size:.3}" fill="#fff"/>"##,
+        white_center - white_size * 0.5,
+        white_center - white_size * 0.5,
+    ));
+    push_wechat_logo_paths(svg, logo_center_x, logo_center_y, black_size);
+}
+
+fn push_wechat_logo_paths(svg: &mut String, cx: f64, cy: f64, badge_size: f64) {
+    let scale = badge_size / WECHAT_LOGO_REFERENCE_BADGE_SIZE;
+    let tx = cx - WECHAT_LOGO_REFERENCE_CENTER.0 * scale;
+    let ty = cy - WECHAT_LOGO_REFERENCE_CENTER.1 * scale;
+    svg.push_str(&format!(
+        r#"<g transform="matrix({scale:.6} 0 0 {scale:.6} {tx:.6} {ty:.6})">"#
+    ));
+    for path in WECHAT_LOGO_PATHS {
+        svg.push_str(&format!(r##"<path d="{path}" fill="#000"/>"##));
+    }
+    svg.push_str("</g>");
+}
+
+fn is_qr_finder_area(size: usize, x: usize, y: usize) -> bool {
+    size >= 7 && ((x < 7 && y < 7) || (x >= size - 7 && y < 7) || (x < 7 && y >= size - 7))
+}
+
+fn standard_qr_module_is_black(matrix: &QrMatrix, size: usize, x: usize, y: usize) -> bool {
+    standard_qr_finder_module(size, x, y).unwrap_or_else(|| matrix[y][x])
+}
+
+fn standard_qr_finder_module(size: usize, x: usize, y: usize) -> Option<bool> {
+    if size < 7 {
+        return None;
+    }
+
+    let local = if x < 7 && y < 7 {
+        Some((x, y))
+    } else if x >= size - 7 && y < 7 {
+        Some((x - (size - 7), y))
+    } else if x < 7 && y >= size - 7 {
+        Some((x, y - (size - 7)))
+    } else {
+        None
+    }?;
+
+    Some(qr_standard_finder_expected(local.0, local.1))
+}
+
+fn qr_standard_finder_expected(x: usize, y: usize) -> bool {
+    let dx = (x as i32 - 3).abs();
+    let dy = (y as i32 - 3).abs();
+    dx.max(dy) != 2
+}
+
+fn qr_finder_origins(size: usize) -> [(usize, usize); 3] {
+    [(0, 0), (size - 7, 0), (0, size - 7)]
+}
+
+pub fn qr_matrix_to_preview_image(
+    matrix: &QrMatrix,
+    appearance: QrAppearance,
+    diff: Option<&DiffResult>,
+    show_diff: bool,
+    scale: u32,
+    border: u32,
+) -> DynamicImage {
+    let modules = matrix.len() as u32;
+    let scale = scale.max(1);
+    let style_pad = qr_preview_style_padding(appearance, scale);
+    let image_size = (modules + border * 2).max(1) * scale + style_pad;
+    let mut image = RgbaImage::from_pixel(image_size, image_size, Rgba([255, 255, 255, 255]));
+
+    for (module_y, row) in matrix.iter().enumerate() {
+        for (module_x, &is_black) in row.iter().enumerate() {
+            let should_paint = match appearance {
+                QrAppearance::Standard => {
+                    standard_qr_module_is_black(matrix, matrix.len(), module_x, module_y)
+                }
+                QrAppearance::Wechat | QrAppearance::Xiaohongshu => is_black,
+            };
+            if !should_paint {
+                continue;
+            }
+            if appearance != QrAppearance::Standard
+                && is_qr_finder_area(matrix.len(), module_x, module_y)
+            {
+                continue;
+            }
+            let module_x = module_x as u32;
+            let module_y = module_y as u32;
+            let start_x = style_pad + (module_x + border) * scale;
+            let start_y = style_pad + (module_y + border) * scale;
+            let black = Rgba([0, 0, 0, 255]);
+
+            match appearance {
+                QrAppearance::Standard => paint_filled_rect_px(
+                    &mut image,
+                    start_x as f64,
+                    start_y as f64,
+                    scale as f64,
+                    scale as f64,
+                    black,
+                ),
+                QrAppearance::Wechat => paint_filled_round_rect(
+                    &mut image,
+                    start_x as f64 + scale as f64 * (1.0 - WECHAT_DATA_SIDE_RATIO) * 0.5,
+                    start_y as f64 + scale as f64 * (1.0 - WECHAT_DATA_SIDE_RATIO) * 0.5,
+                    scale as f64 * WECHAT_DATA_SIDE_RATIO,
+                    scale as f64 * WECHAT_DATA_SIDE_RATIO,
+                    scale as f64 * WECHAT_DATA_RADIUS_RATIO,
+                    black,
+                ),
+                QrAppearance::Xiaohongshu => paint_filled_circle(
+                    &mut image,
+                    (
+                        start_x as f64 + scale as f64 * 0.5,
+                        start_y as f64 + scale as f64 * 0.5,
+                    ),
+                    scale as f64 * 0.31,
+                    black,
+                ),
+            }
+        }
+    }
+
+    if appearance != QrAppearance::Standard && matrix.len() >= 7 {
+        for (x, y) in qr_finder_origins(matrix.len()) {
+            let px = style_pad + (x as u32 + border) * scale;
+            let py = style_pad + (y as u32 + border) * scale;
+            match appearance {
+                QrAppearance::Wechat => {
+                    paint_wechat_qr_finder(&mut image, px as f64, py as f64, scale as f64)
+                }
+                QrAppearance::Xiaohongshu => {
+                    paint_xiaohongshu_qr_finder(&mut image, px as f64, py as f64, scale as f64)
+                }
+                QrAppearance::Standard => {}
+            }
+        }
+    }
+
+    if appearance == QrAppearance::Wechat && matrix.len() >= 21 {
+        let qr_origin = style_pad as f64 + border as f64 * scale as f64;
+        paint_wechat_qr_badge(
+            &mut image,
+            qr_origin,
+            qr_origin,
+            modules as f64 * scale as f64,
+            scale as f64,
+        );
+    }
+
+    if let Some(diff) = diff.filter(|_| show_diff) {
+        let missing_set: HashSet<(u32, u32)> = diff.missing_in_generated.iter().copied().collect();
+        let extra_set: HashSet<(u32, u32)> = diff.extra_in_generated.iter().copied().collect();
+        for (modules, color) in [
+            (&missing_set, Rgba([220, 32, 32, 255])),
+            (&extra_set, Rgba([32, 96, 220, 255])),
+        ] {
+            for &(module_x, module_y) in modules {
+                let start_x = style_pad + (module_x + border) * scale;
+                let start_y = style_pad + (module_y + border) * scale;
+                paint_filled_rect_px(
+                    &mut image,
+                    start_x as f64,
+                    start_y as f64,
+                    scale as f64,
+                    scale as f64,
+                    color,
+                );
+            }
+        }
+    }
+
+    DynamicImage::ImageRgba8(image)
+}
+
+fn qr_preview_style_padding(appearance: QrAppearance, scale: u32) -> u32 {
+    if appearance == QrAppearance::Wechat {
+        (-WECHAT_FINDER_OFFSET_RATIO * scale as f64).ceil() as u32
+    } else {
+        0
+    }
+}
+
+fn paint_wechat_qr_finder(image: &mut RgbaImage, x: f64, y: f64, scale: f64) {
+    let black = Rgba([0, 0, 0, 255]);
+    let white = Rgba([255, 255, 255, 255]);
+    paint_filled_round_rect(
+        image,
+        x + scale * WECHAT_FINDER_OFFSET_RATIO,
+        y + scale * WECHAT_FINDER_OFFSET_RATIO,
+        scale * WECHAT_FINDER_OUTER_SIZE_RATIO,
+        scale * WECHAT_FINDER_OUTER_SIZE_RATIO,
+        scale * WECHAT_FINDER_OUTER_RADIUS_RATIO,
+        black,
+    );
+    paint_filled_round_rect(
+        image,
+        x + scale * WECHAT_FINDER_HOLE_OFFSET_RATIO,
+        y + scale * WECHAT_FINDER_HOLE_OFFSET_RATIO,
+        scale * WECHAT_FINDER_HOLE_SIZE_RATIO,
+        scale * WECHAT_FINDER_HOLE_SIZE_RATIO,
+        scale * WECHAT_FINDER_HOLE_RADIUS_RATIO,
+        white,
+    );
+    paint_filled_round_rect(
+        image,
+        x + scale * WECHAT_FINDER_INNER_OFFSET_RATIO,
+        y + scale * WECHAT_FINDER_INNER_OFFSET_RATIO,
+        scale * WECHAT_FINDER_INNER_SIZE_RATIO,
+        scale * WECHAT_FINDER_INNER_SIZE_RATIO,
+        scale * WECHAT_FINDER_INNER_RADIUS_RATIO,
+        black,
+    );
+}
+
+fn paint_xiaohongshu_qr_finder(image: &mut RgbaImage, x: f64, y: f64, scale: f64) {
+    let center = (x + scale * 3.5, y + scale * 3.5);
+    paint_filled_circle(image, center, scale * 3.50, Rgba([0, 0, 0, 255]));
+    paint_filled_circle(image, center, scale * 2.50, Rgba([255, 255, 255, 255]));
+    paint_filled_circle(image, center, scale * 1.50, Rgba([0, 0, 0, 255]));
+}
+
+fn paint_wechat_qr_badge(image: &mut RgbaImage, x: f64, y: f64, canvas: f64, module: f64) {
+    let center_x = x + canvas * 0.5;
+    let center_y = y + canvas * 0.5;
+    let white_center_x = center_x + module * WECHAT_BADGE_WHITE_CENTER_OFFSET_MODULES;
+    let white_center_y = center_y + module * WECHAT_BADGE_WHITE_CENTER_OFFSET_MODULES;
+    let logo_center_x = center_x + module * WECHAT_LOGO_CENTER_OFFSET_X_MODULES;
+    let logo_center_y = center_y + module * WECHAT_LOGO_CENTER_OFFSET_Y_MODULES;
+    let white_size = canvas * WECHAT_BADGE_WHITE_SIZE_QR_RATIO;
+    let black_size = canvas * WECHAT_LOGO_SIZE_QR_RATIO;
+    paint_filled_rect_px(
+        image,
+        white_center_x - white_size * 0.5,
+        white_center_y - white_size * 0.5,
+        white_size,
+        white_size,
+        Rgba([255, 255, 255, 255]),
+    );
+    paint_filled_round_rect(
+        image,
+        logo_center_x - black_size * 0.5,
+        logo_center_y - black_size * 0.5,
+        black_size,
+        black_size,
+        black_size * 0.10,
+        Rgba([0, 0, 0, 255]),
+    );
+    paint_wechat_logo(image, (logo_center_x, logo_center_y), black_size * 0.42);
+}
+
+fn paint_wechat_logo(image: &mut RgbaImage, center: (f64, f64), radius: f64) {
+    let white = Rgba([255, 255, 255, 255]);
+    let black = Rgba([0, 0, 0, 255]);
+    let big = radius;
+    let small = radius * 0.82;
+    let big_center = (center.0 - radius * 0.22, center.1 - radius * 0.10);
+    let small_center = (center.0 + radius * 0.28, center.1 + radius * 0.20);
+    paint_filled_ellipse(image, big_center, big * 0.74, big * 0.52, white);
+    paint_filled_ellipse(image, small_center, small * 0.74, small * 0.52, white);
+    for (eye_x, eye_y, r) in [
+        (
+            big_center.0 - big * 0.24,
+            big_center.1 - big * 0.10,
+            big * 0.065,
+        ),
+        (
+            big_center.0 + big * 0.20,
+            big_center.1 - big * 0.10,
+            big * 0.065,
+        ),
+        (
+            small_center.0 - small * 0.20,
+            small_center.1 - small * 0.08,
+            small * 0.070,
+        ),
+        (
+            small_center.0 + small * 0.20,
+            small_center.1 - small * 0.08,
+            small * 0.070,
+        ),
+    ] {
+        paint_filled_circle(image, (eye_x, eye_y), r, black);
+    }
 }
 
 pub fn wx_grid_to_svg(grid: &WxGrid) -> String {
@@ -358,107 +885,65 @@ pub fn dy_grid_to_svg(grid: &DyGrid) -> String {
         return dy_black_border_grid_to_svg(grid);
     }
 
-    let canvas = (grid.rings.first().map(|ring| ring.r_outer).unwrap_or(1.0) * 2.3).max(1.0);
-    let center = canvas * 0.5;
+    dy_no_border_grid_to_svg(grid)
+}
+
+fn dy_no_border_grid_to_svg(grid: &DyGrid) -> String {
+    let layout = DOUYIN_NO_BORDER_LAYOUT;
     let mut svg = String::new();
     svg.push_str(&format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{canvas:.3}mm" height="{canvas:.3}mm" viewBox="0 0 {canvas:.3} {canvas:.3}" shape-rendering="geometricPrecision">"#
-    ));
-    svg.push_str(&format!(
-        r##"<rect x="0" y="0" width="{canvas:.3}" height="{canvas:.3}" fill="#fff"/>"##
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {:.2} {:.2}" shape-rendering="geometricPrecision">"#,
+        layout.viewbox.0, layout.viewbox.1
     ));
 
     if grid.points_per_ring == 0 || grid.rings.is_empty() {
+        svg.push_str(&standard_no_border_static_marks_group(layout));
         svg.push_str("</svg>");
         return svg;
     }
 
+    let scale = DOUYIN_NO_BORDER_LOCATOR_DISTANCE / grid_locator_distance(grid).max(1.0);
     let theta_step = std::f64::consts::TAU / grid.points_per_ring as f64;
+    svg.push_str(r#"<g id="a">"#);
     for (ring_idx, ring) in grid.rings.iter().enumerate() {
         for run in dy_sample_runs(grid, ring_idx as u32) {
             let Some(mark) =
-                dy_mark_geometry(grid.has_border, grid.theta_offset, ring, run, theta_step)
+                dy_mark_geometry(false, layout.code_theta_offset, ring, run, theta_step)
             else {
                 continue;
             };
-            if grid.has_border {
+            if run.len() == 1 {
+                let p = polar_point(
+                    layout.center.0,
+                    layout.center.1,
+                    mark.radius * scale,
+                    mark.theta_mid(),
+                );
                 svg.push_str(&format!(
-                    r##"<path d="{}" fill="#000"/>"##,
-                    polar_sector_path(
-                        center,
-                        center,
-                        mark.r_inner,
-                        mark.r_outer,
-                        mark.theta_start,
-                        mark.theta_end,
-                    )
+                    r##"<circle cx="{:.2}" cy="{:.2}" r="{:.2}" style="fill:{};"/>"##,
+                    p.0,
+                    p.1,
+                    mark.stroke_width * scale * 0.5,
+                    layout.black_fill,
                 ));
             } else {
-                if run.len() == 1 {
-                    let p = polar_point(center, center, mark.radius, mark.theta_mid());
-                    svg.push_str(&format!(
-                        r##"<circle cx="{:.3}" cy="{:.3}" r="{:.3}" fill="#000"/>"##,
-                        p.0,
-                        p.1,
-                        mark.stroke_width * 0.5,
-                    ));
-                } else {
-                    svg.push_str(&format!(
-                        r##"<path d="{}" fill="#000"/>"##,
-                        rounded_arc_bar_path(
-                            center,
-                            center,
-                            mark.radius,
-                            mark.stroke_width,
-                            mark.theta_start,
-                            mark.theta_end,
-                        )
-                    ));
-                }
+                svg.push_str(&format!(
+                    r##"<path d="{}" style="fill:{};"/>"##,
+                    rounded_arc_bar_path(
+                        layout.center.0,
+                        layout.center.1,
+                        mark.radius * scale,
+                        mark.stroke_width * scale,
+                        mark.theta_start,
+                        mark.theta_end,
+                    ),
+                    layout.black_fill,
+                ));
             }
         }
     }
-
-    for finder in &grid.finders {
-        let cx = center + finder.cx - grid.center.0;
-        let cy = center + finder.cy - grid.center.1;
-        let outer = finder.outer_radius();
-        svg.push_str(&format!(
-            r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{outer:.3}" fill="#000"/>"##
-        ));
-        svg.push_str(&format!(
-            r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#fff"/>"##,
-            outer * 0.62
-        ));
-        svg.push_str(&format!(
-            r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#000"/>"##,
-            outer * 0.18
-        ));
-    }
-
-    if let Some(badge) = grid.badge {
-        let cx = center + badge.cx - grid.center.0;
-        let cy = center + badge.cy - grid.center.1;
-        svg.push_str(&format!(
-            r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#000"/>"##,
-            badge.radius
-        ));
-        svg.push_str(&format!(
-            r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#fff"/>"##,
-            badge.radius * 0.78
-        ));
-        svg.push_str(&douyin_logo_markup(cx, cy, badge.radius));
-    }
-
-    if let Some(logo) = grid.center_logo {
-        let cx = center + logo.cx - grid.center.0;
-        let cy = center + logo.cy - grid.center.1;
-        svg.push_str(&format!(
-            r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{:.3}" fill="#f33"/>"##,
-            logo.radius
-        ));
-    }
-
+    svg.push_str("</g>");
+    svg.push_str(&standard_no_border_static_marks_group(layout));
     svg.push_str("</svg>");
     svg
 }
@@ -560,6 +1045,10 @@ fn dy_black_border_grid_to_svg(grid: &DyGrid) -> String {
 
 pub fn dy_grid_to_preview_image(grid: &DyGrid, size: u32) -> DynamicImage {
     let size = size.max(1);
+    if !grid.has_border {
+        return dy_no_border_grid_to_preview_image(grid, size);
+    }
+
     let mut image = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
     if grid.points_per_ring == 0 || grid.rings.is_empty() {
         return DynamicImage::ImageRgba8(image);
@@ -718,12 +1207,64 @@ pub fn dy_grid_to_preview_image(grid: &DyGrid, size: u32) -> DynamicImage {
     DynamicImage::ImageRgba8(image)
 }
 
+fn dy_no_border_grid_to_preview_image(grid: &DyGrid, size: u32) -> DynamicImage {
+    let mut image = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
+    let layout = DOUYIN_NO_BORDER_LAYOUT;
+    let transform = preview_fit_transform(layout.viewbox, size);
+
+    if grid.points_per_ring != 0 && !grid.rings.is_empty() {
+        let svg_scale = DOUYIN_NO_BORDER_LOCATOR_DISTANCE / grid_locator_distance(grid).max(1.0);
+        let render_scale = transform.scale * svg_scale;
+        let center = transform.point(layout.center);
+        let theta_step = std::f64::consts::TAU / grid.points_per_ring as f64;
+        for (ring_idx, ring) in grid.rings.iter().enumerate() {
+            for run in dy_sample_runs(grid, ring_idx as u32) {
+                let Some(mark) =
+                    dy_mark_geometry(false, layout.code_theta_offset, ring, run, theta_step)
+                else {
+                    continue;
+                };
+                if run.len() == 1 {
+                    let point =
+                        polar_point_px(center, mark.radius * render_scale, mark.theta_mid());
+                    paint_filled_circle(
+                        &mut image,
+                        point,
+                        mark.stroke_width * render_scale * 0.5,
+                        Rgba([0, 0, 0, 255]),
+                    );
+                } else {
+                    paint_arc_stroke_xy(
+                        &mut image,
+                        center,
+                        render_scale,
+                        RasterArcStroke {
+                            radius: mark.radius,
+                            theta_start: mark.theta_start,
+                            theta_end: mark.theta_end,
+                            stroke_radius: mark.stroke_width * render_scale * 0.5,
+                        },
+                        Rgba([0, 0, 0, 255]),
+                    );
+                }
+            }
+        }
+    }
+
+    paint_no_border_static_marks(&mut image, layout, transform);
+    DynamicImage::ImageRgba8(image)
+}
+
 pub fn dy_grid_to_diff_preview_image(
     grid: &DyGrid,
     source: &BinaryImage,
     show_diff: bool,
     size: u32,
 ) -> (DynamicImage, u32) {
+    if !grid.has_border {
+        return dy_no_border_grid_to_diff_preview_image(grid, source, show_diff, size);
+    }
+
     let mut image = dy_grid_to_preview_image(grid, size).to_rgba8();
     if grid.points_per_ring == 0 || grid.rings.is_empty() {
         return (DynamicImage::ImageRgba8(image), 0);
@@ -740,6 +1281,55 @@ pub fn dy_grid_to_diff_preview_image(
                 grid.center.0 + (x as f64 - preview_center) / scale,
                 grid.center.1 + (y as f64 - preview_center) / scale,
             );
+            if is_dy_diff_ignored(grid, source_point) {
+                continue;
+            }
+
+            let generated = image.get_pixel(x, y).0;
+            let generated_black = generated[0] < 96 && generated[1] < 96 && generated[2] < 96;
+            let original_black =
+                source.is_black(source_point.0.round() as i32, source_point.1.round() as i32);
+            if original_black == generated_black {
+                continue;
+            }
+
+            diff_count += 1;
+            if show_diff {
+                let color = if original_black {
+                    Rgba([220, 32, 32, 255])
+                } else {
+                    Rgba([32, 96, 220, 255])
+                };
+                image.put_pixel(x, y, color);
+            }
+        }
+    }
+
+    (DynamicImage::ImageRgba8(image), diff_count)
+}
+
+fn dy_no_border_grid_to_diff_preview_image(
+    grid: &DyGrid,
+    source: &BinaryImage,
+    show_diff: bool,
+    size: u32,
+) -> (DynamicImage, u32) {
+    let mut image = dy_no_border_grid_to_preview_image(grid, size.max(1)).to_rgba8();
+    if grid.points_per_ring == 0 || grid.rings.is_empty() {
+        return (DynamicImage::ImageRgba8(image), 0);
+    }
+
+    let layout = DOUYIN_NO_BORDER_LAYOUT;
+    let transform = preview_fit_transform(layout.viewbox, image.width().max(1));
+    let svg_scale = DOUYIN_NO_BORDER_LOCATOR_DISTANCE / grid_locator_distance(grid).max(1.0);
+    let rotation = grid.theta_offset - layout.code_theta_offset;
+    let mut diff_count = 0_u32;
+
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            let layout_point = transform.inverse_point((x as f64 + 0.5, y as f64 + 0.5));
+            let source_point =
+                no_border_layout_to_source_point(grid, layout, svg_scale, rotation, layout_point);
             if is_dy_diff_ignored(grid, source_point) {
                 continue;
             }
@@ -819,6 +1409,16 @@ fn standard_black_border_static_marks_group(layout: DouyinBlackBorderLayout) -> 
     Some(group)
 }
 
+fn standard_no_border_static_marks_group(layout: DouyinNoBorderLayout) -> String {
+    let mut group = String::from(r#"<g id="b">"#);
+    for (cx, cy) in layout.locators {
+        group.push_str(&no_border_locator_markup(cx, cy, layout));
+    }
+    group.push_str(&no_border_badge_markup(layout));
+    group.push_str("</g>");
+    group
+}
+
 fn black_border_badge_markup(layout: DouyinBlackBorderLayout) -> String {
     let badge = layout.badge;
     let mut markup = format!(
@@ -853,9 +1453,32 @@ fn black_border_badge_markup(layout: DouyinBlackBorderLayout) -> String {
     markup
 }
 
+fn no_border_badge_markup(layout: DouyinNoBorderLayout) -> String {
+    let badge = layout.badge;
+    format!(
+        r##"<circle cx="{:.2}" cy="{:.2}" r="{:.2}" style="fill:{};"/><circle cx="{:.2}" cy="{:.2}" r="{:.2}" style="fill:#fff;"/><path d="{}" style="fill-rule:evenodd;"/>"##,
+        badge.cx,
+        badge.cy,
+        badge.outer_radius,
+        layout.black_fill,
+        badge.cx,
+        badge.cy,
+        badge.inner_radius,
+        DOUYIN_NO_BORDER_LOGO_PATH
+    )
+}
+
 fn black_border_locator_markup(cx: f64, cy: f64, black_fill: &str) -> String {
     format!(
         r##"<circle cx="{cx:.2}" cy="{cy:.2}" r="36.85" style="fill:#fff;"/><circle cx="{cx:.2}" cy="{cy:.2}" r="28.71" style="fill:{black_fill};"/><circle cx="{cx:.2}" cy="{cy:.2}" r="18.24" style="fill:#fff;"/><circle cx="{cx:.2}" cy="{cy:.2}" r="8.05" style="fill:{black_fill};"/>"##
+    )
+}
+
+fn no_border_locator_markup(cx: f64, cy: f64, layout: DouyinNoBorderLayout) -> String {
+    let (outer, middle, inner) = layout.locator_radii;
+    let black_fill = layout.black_fill;
+    format!(
+        r##"<circle cx="{cx:.2}" cy="{cy:.2}" r="{outer:.2}" style="fill:{black_fill};"/><circle cx="{cx:.2}" cy="{cy:.2}" r="{middle:.2}" style="fill:#fff;"/><circle cx="{cx:.2}" cy="{cy:.2}" r="{inner:.2}" style="fill:{black_fill};"/>"##
     )
 }
 
@@ -888,8 +1511,98 @@ fn mini_program_logo_path(cx: f64, cy: f64, radius: f64) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreviewFitTransform {
+    scale: f64,
+    offset: (f64, f64),
+}
+
+impl PreviewFitTransform {
+    fn point(self, point: (f64, f64)) -> (f64, f64) {
+        (
+            self.offset.0 + point.0 * self.scale,
+            self.offset.1 + point.1 * self.scale,
+        )
+    }
+
+    fn inverse_point(self, point: (f64, f64)) -> (f64, f64) {
+        (
+            (point.0 - self.offset.0) / self.scale,
+            (point.1 - self.offset.1) / self.scale,
+        )
+    }
+
+    fn radius(self, radius: f64) -> f64 {
+        radius * self.scale
+    }
+}
+
+fn preview_fit_transform(viewbox: (f64, f64), size: u32) -> PreviewFitTransform {
+    let side = size.max(1) as f64 - 1.0;
+    let scale = side / viewbox.0.max(viewbox.1).max(1.0);
+    PreviewFitTransform {
+        scale,
+        offset: (
+            (side - viewbox.0 * scale) * 0.5,
+            (side - viewbox.1 * scale) * 0.5,
+        ),
+    }
+}
+
+fn no_border_layout_to_source_point(
+    grid: &DyGrid,
+    layout: DouyinNoBorderLayout,
+    svg_scale: f64,
+    rotation: f64,
+    point: (f64, f64),
+) -> (f64, f64) {
+    let dx = point.0 - layout.center.0;
+    let dy = point.1 - layout.center.1;
+    let radius = dx.hypot(dy) / svg_scale.max(f64::EPSILON);
+    let theta = dy.atan2(dx) + rotation;
+    (
+        grid.center.0 + radius * theta.cos(),
+        grid.center.1 + radius * theta.sin(),
+    )
+}
+
+fn paint_no_border_static_marks(
+    image: &mut RgbaImage,
+    layout: DouyinNoBorderLayout,
+    transform: PreviewFitTransform,
+) {
+    let black = Rgba([0, 0, 0, 255]);
+    let white = Rgba([255, 255, 255, 255]);
+    let (outer, middle, inner) = layout.locator_radii;
+
+    for locator in layout.locators {
+        let center = transform.point(locator);
+        paint_filled_circle(image, center, transform.radius(outer), black);
+        paint_filled_circle(image, center, transform.radius(middle), white);
+        paint_filled_circle(image, center, transform.radius(inner), black);
+    }
+
+    let badge = layout.badge;
+    let center = transform.point((badge.cx, badge.cy));
+    paint_filled_circle(image, center, transform.radius(badge.outer_radius), black);
+    paint_filled_circle(image, center, transform.radius(badge.inner_radius), white);
+    paint_douyin_logo_shape(
+        image,
+        center,
+        transform.radius(badge.inner_radius),
+        Rgba([0, 0, 0, 255]),
+    );
+}
+
 fn polar_point(cx: f64, cy: f64, radius: f64, theta: f64) -> (f64, f64) {
     (cx + radius * theta.cos(), cy + radius * theta.sin())
+}
+
+fn polar_point_px(center: (f64, f64), radius: f64, theta: f64) -> (f64, f64) {
+    (
+        center.0 + radius * theta.cos(),
+        center.1 + radius * theta.sin(),
+    )
 }
 
 fn scaled_polar_point(center: f64, scale: f64, radius: f64, theta: f64) -> (f64, f64) {
@@ -1001,8 +1714,14 @@ fn dy_mark_geometry(
         });
     }
 
-    let stroke_width = radial_step * 0.42;
-    let angular_inset = theta_step * if run_len == 1 { 0.26 } else { 0.18 };
+    let stroke_width = if ring.is_decoration && run_len > 1 {
+        radial_step * DOUYIN_NO_BORDER_DECORATIVE_RUN_WIDTH_SCALE
+    } else if run_len > 1 {
+        radial_step * DOUYIN_NO_BORDER_CODE_RUN_WIDTH_SCALE
+    } else {
+        radial_step
+    };
+    let angular_inset = theta_step * if run_len == 1 { 0.26 } else { 0.56 };
     let theta_start = theta_offset + run.start as f64 * theta_step + angular_inset;
     let theta_end = theta_offset + run.end as f64 * theta_step - angular_inset;
     if theta_end <= theta_start {
@@ -1096,6 +1815,32 @@ fn paint_arc_stroke(
         let t = step as f64 / steps as f64;
         let theta = stroke.theta_start + (stroke.theta_end - stroke.theta_start) * t;
         let next = scaled_polar_point(center, scale, stroke.radius, theta);
+        paint_capsule(image, previous, next, stroke.stroke_radius, color);
+        previous = next;
+    }
+}
+
+fn paint_arc_stroke_xy(
+    image: &mut RgbaImage,
+    center: (f64, f64),
+    scale: f64,
+    stroke: RasterArcStroke,
+    color: Rgba<u8>,
+) {
+    let span = (stroke.theta_end - stroke.theta_start).abs();
+    if span <= f64::EPSILON || stroke.stroke_radius <= 0.0 {
+        return;
+    }
+
+    let arc_len = span * stroke.radius * scale;
+    let steps = (arc_len / (stroke.stroke_radius.max(1.0) * 0.75))
+        .ceil()
+        .clamp(2.0, 96.0) as u32;
+    let mut previous = polar_point_px(center, stroke.radius * scale, stroke.theta_start);
+    for step in 1..=steps {
+        let t = step as f64 / steps as f64;
+        let theta = stroke.theta_start + (stroke.theta_end - stroke.theta_start) * t;
+        let next = polar_point_px(center, stroke.radius * scale, theta);
         paint_capsule(image, previous, next, stroke.stroke_radius, color);
         previous = next;
     }
@@ -1339,6 +2084,107 @@ fn push_cubic_points(
     }
 }
 
+fn paint_filled_rect_px(
+    image: &mut RgbaImage,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    color: Rgba<u8>,
+) {
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let min_x = x.floor().max(0.0) as i32;
+    let max_x = (x + width).ceil().min(image.width() as f64) as i32 - 1;
+    let min_y = y.floor().max(0.0) as i32;
+    let max_y = (y + height).ceil().min(image.height() as f64) as i32 - 1;
+    if max_x < min_x || max_y < min_y {
+        return;
+    }
+
+    for yy in min_y..=max_y {
+        for xx in min_x..=max_x {
+            image.put_pixel(xx as u32, yy as u32, color);
+        }
+    }
+}
+
+fn paint_filled_round_rect(
+    image: &mut RgbaImage,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+    color: Rgba<u8>,
+) {
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let radius = radius.max(0.0).min(width.min(height) * 0.5);
+    let min_x = x.floor().max(0.0) as i32;
+    let max_x = (x + width).ceil().min(image.width() as f64) as i32 - 1;
+    let min_y = y.floor().max(0.0) as i32;
+    let max_y = (y + height).ceil().min(image.height() as f64) as i32 - 1;
+    if max_x < min_x || max_y < min_y {
+        return;
+    }
+
+    for yy in min_y..=max_y {
+        for xx in min_x..=max_x {
+            let px = xx as f64 + 0.5;
+            let py = yy as f64 + 0.5;
+            let dx = if px < x + radius {
+                x + radius - px
+            } else if px > x + width - radius {
+                px - (x + width - radius)
+            } else {
+                0.0
+            };
+            let dy = if py < y + radius {
+                y + radius - py
+            } else if py > y + height - radius {
+                py - (y + height - radius)
+            } else {
+                0.0
+            };
+            if dx * dx + dy * dy <= radius * radius {
+                image.put_pixel(xx as u32, yy as u32, color);
+            }
+        }
+    }
+}
+
+fn paint_filled_ellipse(
+    image: &mut RgbaImage,
+    center: (f64, f64),
+    radius_x: f64,
+    radius_y: f64,
+    color: Rgba<u8>,
+) {
+    if radius_x <= 0.0 || radius_y <= 0.0 {
+        return;
+    }
+    let min_x = (center.0 - radius_x).floor().max(0.0) as i32;
+    let max_x = (center.0 + radius_x).ceil().min(image.width() as f64) as i32 - 1;
+    let min_y = (center.1 - radius_y).floor().max(0.0) as i32;
+    let max_y = (center.1 + radius_y).ceil().min(image.height() as f64) as i32 - 1;
+    if max_x < min_x || max_y < min_y {
+        return;
+    }
+
+    for yy in min_y..=max_y {
+        for xx in min_x..=max_x {
+            let dx = (xx as f64 + 0.5 - center.0) / radius_x;
+            let dy = (yy as f64 + 0.5 - center.1) / radius_y;
+            if dx * dx + dy * dy <= 1.0 {
+                image.put_pixel(xx as u32, yy as u32, color);
+            }
+        }
+    }
+}
+
 fn paint_filled_circle(image: &mut RgbaImage, center: (f64, f64), radius: f64, color: Rgba<u8>) {
     let min_x = ((center.0 - radius).floor() as i32).max(0);
     let max_x = ((center.0 + radius).ceil() as i32).min(image.width() as i32 - 1);
@@ -1434,6 +2280,132 @@ mod tests {
     }
 
     #[test]
+    fn standard_qr_svg_canonicalizes_finder_regions() {
+        let matrix = vec![vec![false; 21]; 21];
+
+        let svg = qr_matrix_to_svg(&matrix, 1.0);
+
+        assert!(
+            svg.contains(
+                r##"<rect x="0.000" y="0.000" width="1.000" height="1.000" fill="#000"/>"##
+            )
+        );
+        assert!(svg.contains(
+            r##"<rect x="20.000" y="0.000" width="1.000" height="1.000" fill="#000"/>"##
+        ));
+        assert!(svg.contains(
+            r##"<rect x="0.000" y="20.000" width="1.000" height="1.000" fill="#000"/>"##
+        ));
+        assert!(
+            svg.contains(
+                r##"<rect x="2.000" y="2.000" width="1.000" height="1.000" fill="#000"/>"##
+            )
+        );
+        assert!(
+            !svg.contains(
+                r##"<rect x="1.000" y="1.000" width="1.000" height="1.000" fill="#000"/>"##
+            )
+        );
+    }
+
+    #[test]
+    fn styled_qr_svg_uses_matrix_modules_without_reference_grid() {
+        let mut matrix = vec![vec![false; 21]; 21];
+        matrix[10][10] = true;
+        for i in 0..7 {
+            matrix[0][i] = true;
+            matrix[i][0] = true;
+            matrix[6][i] = true;
+            matrix[i][6] = true;
+        }
+
+        let svg = qr_matrix_to_svg_with_appearance(&matrix, 1.0, QrAppearance::Xiaohongshu);
+
+        assert!(svg.contains("<circle"));
+        assert!(svg.contains(r#"r="3.500""#));
+        assert!(!svg.contains(r#"style="fill:#fff;""#));
+    }
+
+    #[test]
+    fn wechat_qr_svg_includes_badge_and_rounded_marks() {
+        let mut matrix = vec![vec![false; 21]; 21];
+        matrix[8][8] = true;
+
+        let svg = qr_matrix_to_svg_with_appearance(&matrix, 1.0, QrAppearance::Wechat);
+
+        assert!(svg.contains(r#"viewBox="-0.106 -0.106 21.106 21.106""#));
+        assert!(svg.contains(r#"width="0.767" height="0.767" rx="0.124""#));
+        assert!(svg.contains(
+            r##"<rect x="-0.106" y="-0.106" width="7.004" height="7.004" rx="0.714" ry="0.714" fill="#000"/>"##
+        ));
+        assert!(svg.contains(
+            r##"<rect x="0.859" y="0.859" width="5.071" height="5.071" rx="0.364" ry="0.364" fill="#fff"/>"##
+        ));
+        assert!(svg.contains(
+            r##"<rect x="1.887" y="1.887" width="3.014" height="3.014" rx="0.392" ry="0.392" fill="#000"/>"##
+        ));
+        assert!(svg.contains(r#"M66.85,44.42h-19.5"#));
+        assert!(!svg.contains("<ellipse"));
+        assert!(!svg.contains(r#"style="fill:#fff;""#));
+    }
+
+    #[test]
+    fn wechat_qr_svg_uses_reference_badge_geometry_for_version_five() {
+        let matrix = vec![vec![false; 37]; 37];
+
+        let svg = qr_matrix_to_svg_with_appearance(&matrix, 1.0, QrAppearance::Wechat);
+
+        assert!(svg.contains(
+            r##"<rect x="13.021" y="13.021" width="11.018" height="11.018" fill="#fff"/>"##
+        ));
+        assert!(
+            svg.contains(r#"<g transform="matrix(0.353357 0 0 0.353357 -1.759717 -1.816254)">"#)
+        );
+    }
+
+    #[test]
+    fn xiaohongshu_preview_skips_matrix_dots_inside_finder_regions() {
+        let matrix = vec![vec![true; 21]; 21];
+
+        let image =
+            qr_matrix_to_preview_image(&matrix, QrAppearance::Xiaohongshu, None, false, 10, 0)
+                .to_rgba8();
+
+        assert_eq!(image.get_pixel(5, 5).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn standard_qr_preview_canonicalizes_finder_regions() {
+        let matrix = vec![vec![false; 21]; 21];
+
+        let image = qr_matrix_to_preview_image(&matrix, QrAppearance::Standard, None, false, 10, 0)
+            .to_rgba8();
+
+        assert_eq!(image.get_pixel(5, 5).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(15, 15).0, [255, 255, 255, 255]);
+        assert_eq!(image.get_pixel(25, 25).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(205, 5).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(5, 205).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn styled_qr_preview_draws_diff_overlay_above_finder_style() {
+        let matrix = vec![vec![false; 21]; 21];
+        let diff = DiffResult {
+            diff_modules: vec![(0, 0)],
+            missing_in_generated: vec![(0, 0)],
+            extra_in_generated: Vec::new(),
+            diff_count: 1,
+        };
+
+        let image =
+            qr_matrix_to_preview_image(&matrix, QrAppearance::Wechat, Some(&diff), true, 8, 0)
+                .to_rgba8();
+
+        assert_eq!(image.get_pixel(4, 4).0, [220, 32, 32, 255]);
+    }
+
+    #[test]
     fn binary_render_preserves_black_modules() {
         let matrix = vec![vec![true, false], vec![false, true]];
         let binary = qr_matrix_to_binary(&matrix, 2, 1);
@@ -1505,7 +2477,7 @@ mod tests {
             }),
             badge_style: DyBadgeStyle::DouyinLogo,
             center_logo: None,
-            has_border: false,
+            has_border: true,
             samples: vec![false; 4],
         };
 
@@ -1520,6 +2492,83 @@ mod tests {
         assert!(svg.contains(r##"fill="#5ffdff""##));
         assert!(svg.contains(r##"fill="#000""##));
         assert!(!svg.contains("M333.06,347.8"));
+    }
+
+    #[test]
+    fn dy_svg_uses_standard_no_border_static_marks() {
+        let grid = DyGrid {
+            center: (20.0, 20.0),
+            rings: vec![crate::codec::dy_grid::RingSpec {
+                r_inner: 10.0,
+                r_outer: 20.0,
+                is_decoration: false,
+            }],
+            outer_frame: None,
+            decorative_rings: Vec::new(),
+            points_per_ring: 4,
+            theta_offset: 0.0,
+            finders: test_dy_finders(),
+            badge: None,
+            badge_style: DyBadgeStyle::DouyinLogo,
+            center_logo: None,
+            has_border: false,
+            samples: vec![false; 4],
+        };
+
+        let svg = dy_grid_to_svg(&grid);
+
+        assert!(svg.contains(r#"viewBox="0 0 607.34 615.94""#));
+        assert!(svg.contains(&standard_no_border_static_marks_group(
+            DOUYIN_NO_BORDER_LAYOUT
+        )));
+        assert!(svg.contains(DOUYIN_NO_BORDER_LOGO_PATH));
+        assert!(!svg.contains(r##"fill="#fa1e5c""##));
+        assert!(!svg.contains(r##"fill="#5ffdff""##));
+    }
+
+    #[test]
+    fn dy_no_border_decorative_runs_use_tuned_width_except_single_dots() {
+        let theta_step = std::f64::consts::TAU / 120.0;
+        let decorative = crate::codec::dy_grid::RingSpec {
+            r_inner: 96.0,
+            r_outer: 104.0,
+            is_decoration: true,
+        };
+        let code = crate::codec::dy_grid::RingSpec {
+            r_inner: 95.0,
+            r_outer: 105.0,
+            is_decoration: false,
+        };
+
+        let decorative_run = dy_mark_geometry(
+            false,
+            0.0,
+            &decorative,
+            DyRun { start: 0, end: 2 },
+            theta_step,
+        )
+        .unwrap();
+        let decorative_dot = dy_mark_geometry(
+            false,
+            0.0,
+            &decorative,
+            DyRun { start: 0, end: 1 },
+            theta_step,
+        )
+        .unwrap();
+        let code_run =
+            dy_mark_geometry(false, 0.0, &code, DyRun { start: 0, end: 2 }, theta_step).unwrap();
+
+        assert!(
+            (decorative_run.stroke_width - 8.0 * DOUYIN_NO_BORDER_DECORATIVE_RUN_WIDTH_SCALE).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (code_run.stroke_width - 10.0 * DOUYIN_NO_BORDER_CODE_RUN_WIDTH_SCALE).abs()
+                < f64::EPSILON
+        );
+        assert!(decorative_run.stroke_width > code_run.stroke_width);
+        assert!(decorative_dot.stroke_width < code_run.stroke_width);
     }
 
     #[test]
@@ -1551,7 +2600,7 @@ mod tests {
 
         grid.has_border = false;
         let no_border_svg = dy_grid_to_svg(&grid);
-        assert!(no_border_svg.contains(r##"fill="#000""##));
+        assert!(no_border_svg.contains(r##"style="fill:#000;""##));
         assert!(!no_border_svg.contains("stroke"));
         assert!(no_border_svg.matches(" A ").count() > border_svg.matches(" A ").count());
     }
@@ -1579,7 +2628,7 @@ mod tests {
 
         let svg = dy_grid_to_svg(&grid);
 
-        assert_eq!(svg.matches("<circle").count(), 10);
+        assert_eq!(svg.matches("<circle").count(), 12);
         assert!(!svg.contains("stroke"));
     }
 
@@ -1599,6 +2648,40 @@ mod tests {
 
             assert!(mark_count > 40, "{} marks={mark_count}", path.display());
         }
+    }
+
+    #[test]
+    fn dy_no_border_1_uses_standard_svg_fixture_layout() {
+        let Some(path) = sample_paths(&["无框版1"]).into_iter().next() else {
+            return;
+        };
+
+        let img = image::open(&path).unwrap();
+        let bin = crate::pipeline::preprocess::preprocess(&img);
+        let finders = crate::detect::finder_dy::find_dy_finders(&bin);
+        let selected = crate::detect::finder_dy::select_dy_finders(&finders)
+            .unwrap_or_else(|| panic!("failed to select dy finders for {}", path.display()));
+        let params = crate::codec::dy_grid::detect_dy_params(&bin, &selected).unwrap();
+        let grid =
+            crate::codec::dy_grid::sample_dy_with_logos(&bin, &img, &selected, params).unwrap();
+        let svg = dy_grid_to_svg(&grid);
+
+        assert!(!grid.has_border);
+        assert_eq!(grid.ring_count(), 6);
+        assert_eq!(grid.code_ring_count(), 4);
+        assert_eq!(grid.points_per_ring, 120);
+        assert!(grid.rings[0].is_decoration);
+        assert!(!grid.rings[1].is_decoration);
+        assert!(grid.rings[2].is_decoration);
+        assert!(svg.contains(r#"viewBox="0 0 607.34 615.94""#));
+        assert!(svg.contains(r#"<g id="a">"#));
+        assert!(svg.contains(&standard_no_border_static_marks_group(
+            DOUYIN_NO_BORDER_LAYOUT
+        )));
+        assert!(svg.contains(DOUYIN_NO_BORDER_LOGO_PATH));
+        assert!(svg.contains(r##"r="5.00" style="fill:#000;""##));
+        assert!(!svg.contains(r##"fill="#fa1e5c""##));
+        assert!(!svg.contains(r##"fill="#5ffdff""##));
     }
 
     #[test]
@@ -2523,6 +3606,860 @@ mod tests {
                     && prefixes.iter().any(|prefix| name.starts_with(prefix))
             })
             .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_sample_diff_outputs() {
+        use crate::codec::dy_grid::{detect_dy_params, sample_dy_with_logos};
+        use crate::codec::wx_grid::{detect_wx_version, sample_wx_with_badge};
+        use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+        use crate::detect::finder_wx::{
+            find_wx_finders, select_wx_finders_raw, select_wx_finders_raw_with_badge,
+        };
+        use crate::pipeline::perspective::{
+            WxUprightAnchor, detect_dy_badge_anchor, detect_wx_badge_anchor,
+            dy_upright_target_finders, warp_dy_to_upright_image_with_top_right,
+            warp_wx_to_upright_image, wx_upright_target_finders,
+        };
+        use crate::pipeline::preprocess::preprocess;
+
+        let out_dir = std::path::Path::new("target/debug/sample_diff_debug");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        for path in sample_paths(&["小程序码"]) {
+            let img = image::open(&path).unwrap();
+            let raw_binary = preprocess(&img);
+            let finders = find_wx_finders(&raw_binary);
+            let badge_anchor = detect_wx_badge_anchor(&img);
+            let raw_selected = badge_anchor
+                .and_then(|badge| select_wx_finders_raw_with_badge(&finders, badge))
+                .or_else(|| select_wx_finders_raw(&finders))
+                .unwrap_or_else(|| panic!("failed to select wx finders for {}", path.display()));
+            let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+            let corrected_source = warp_wx_to_upright_image(
+                &img,
+                &raw_selected,
+                badge_anchor.map(WxUprightAnchor::Badge),
+                correction_size,
+            );
+            let corrected_binary = preprocess(&corrected_source);
+            let selected = wx_upright_target_finders(&raw_selected, correction_size);
+            let preferred_version = detect_wx_version(&corrected_binary, &selected).ok();
+            let mut best: Option<(u32, bool, crate::codec::wx_grid::WxGrid)> = None;
+            for version in [36, 54, 72] {
+                let Ok(grid) =
+                    sample_wx_with_badge(&corrected_binary, &corrected_source, &selected, version)
+                else {
+                    continue;
+                };
+                let (_, diff_count) =
+                    wx_grid_to_diff_preview_image(&grid, &corrected_binary, false, 1024);
+                let preferred = preferred_version == Some(version);
+                if best.as_ref().is_none_or(|(best_diff, best_preferred, _)| {
+                    diff_count < *best_diff
+                        || (diff_count == *best_diff && preferred && !*best_preferred)
+                }) {
+                    best = Some((diff_count, preferred, grid));
+                }
+            }
+            let Some((_, _, grid)) = best else {
+                panic!("failed to sample wx grid for {}", path.display());
+            };
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            let (diff, diff_count) =
+                wx_grid_to_diff_preview_image(&grid, &corrected_binary, true, 1024);
+            std::fs::write(out_dir.join(format!("{stem}.svg")), wx_grid_to_svg(&grid)).unwrap();
+            diff.save(out_dir.join(format!("{stem}_diff.png"))).unwrap();
+            corrected_source
+                .save(out_dir.join(format!("{stem}_warped.png")))
+                .unwrap();
+            println!(
+                "wx {stem} lines={} points={} diff_count={diff_count}",
+                grid.lines, grid.points_per_line
+            );
+        }
+
+        for path in sample_paths(&["黑框版", "无框版"]) {
+            let img = image::open(&path).unwrap();
+            let raw_binary = preprocess(&img);
+            let raw_finders = find_dy_finders(&raw_binary);
+            let raw_selected = select_dy_finders_raw(&raw_finders)
+                .unwrap_or_else(|| panic!("failed to select dy finders for {}", path.display()));
+            let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+            let top_right =
+                detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+            let corrected_source = warp_dy_to_upright_image_with_top_right(
+                &img,
+                &raw_selected,
+                top_right,
+                correction_size,
+            );
+            let corrected_binary = preprocess(&corrected_source);
+            let selected = dy_upright_target_finders(&raw_selected, correction_size);
+            let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+            let grid =
+                sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                    .unwrap();
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            let (diff, diff_count) =
+                dy_grid_to_diff_preview_image(&grid, &corrected_binary, true, 1024);
+            std::fs::write(out_dir.join(format!("{stem}.svg")), dy_grid_to_svg(&grid)).unwrap();
+            diff.save(out_dir.join(format!("{stem}_diff.png"))).unwrap();
+            corrected_source
+                .save(out_dir.join(format!("{stem}_warped.png")))
+                .unwrap();
+            println!(
+                "dy {stem} border={} rings={} points={} diff_count={diff_count}",
+                grid.has_border,
+                grid.ring_count(),
+                grid.points_per_ring
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_diff_outputs() {
+        use crate::codec::dy_grid::{detect_dy_params, sample_dy_with_logos};
+        use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::pipeline::preprocess::preprocess;
+
+        let out_dir = std::path::Path::new("target/debug/no_border_debug");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        for path in sample_paths(&["无框版"]) {
+            let img = image::open(&path).unwrap();
+            let raw_binary = preprocess(&img);
+            let raw_finders = find_dy_finders(&raw_binary);
+            let raw_selected = select_dy_finders_raw(&raw_finders)
+                .unwrap_or_else(|| panic!("failed to select dy finders for {}", path.display()));
+            let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+            let top_right =
+                detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+            let corrected_source = warp_dy_to_upright_image_with_top_right(
+                &img,
+                &raw_selected,
+                top_right,
+                correction_size,
+            );
+            let corrected_binary = preprocess(&corrected_source);
+            let selected = dy_upright_target_finders(&raw_selected, correction_size);
+            let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+            let grid =
+                sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                    .unwrap();
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            let (diff, diff_count) =
+                dy_grid_to_diff_preview_image(&grid, &corrected_binary, true, 1024);
+            std::fs::write(out_dir.join(format!("{stem}.svg")), dy_grid_to_svg(&grid)).unwrap();
+            diff.save(out_dir.join(format!("{stem}_diff.png"))).unwrap();
+            corrected_source
+                .save(out_dir.join(format!("{stem}_warped.png")))
+                .unwrap();
+            println!(
+                "dy {stem} rings={} points={} diff_count={diff_count}",
+                grid.ring_count(),
+                grid.points_per_ring
+            );
+            let ring_stats = no_border_ring_diff_stats(&grid, &corrected_binary, 1024);
+            let ring_diff_text = ring_stats
+                .iter()
+                .enumerate()
+                .map(|(idx, stats)| {
+                    let red_avg = if stats.red == 0 {
+                        0.0
+                    } else {
+                        stats.red_radial_sum / f64::from(stats.red)
+                    };
+                    let blue_avg = if stats.blue == 0 {
+                        0.0
+                    } else {
+                        stats.blue_radial_sum / f64::from(stats.blue)
+                    };
+                    format!(
+                        "{idx}:{}r@{red_avg:.1}/{}b@{blue_avg:.1}/{}",
+                        stats.red, stats.blue, stats.total
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let black_text = no_border_black_samples_by_ring(&grid)
+                .into_iter()
+                .map(|count| count.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "  ring_diff={ring_diff_text} black_by_ring=[{black_text}] radius_scale={}",
+                no_border_radius_scale_summary(&grid)
+            );
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct RingDiffStats {
+        total: u32,
+        red: u32,
+        blue: u32,
+        red_radial_sum: f64,
+        blue_radial_sum: f64,
+    }
+
+    fn no_border_ring_diff_stats(
+        grid: &DyGrid,
+        source: &BinaryImage,
+        size: u32,
+    ) -> Vec<RingDiffStats> {
+        let image = dy_no_border_grid_to_preview_image(grid, size.max(1)).to_rgba8();
+        let layout = DOUYIN_NO_BORDER_LAYOUT;
+        let transform = preview_fit_transform(layout.viewbox, image.width().max(1));
+        let svg_scale = DOUYIN_NO_BORDER_LOCATOR_DISTANCE / grid_locator_distance(grid).max(1.0);
+        let rotation = grid.theta_offset - layout.code_theta_offset;
+        let mut stats = vec![RingDiffStats::default(); grid.rings.len()];
+
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                let layout_point = transform.inverse_point((x as f64 + 0.5, y as f64 + 0.5));
+                let source_point = no_border_layout_to_source_point(
+                    grid,
+                    layout,
+                    svg_scale,
+                    rotation,
+                    layout_point,
+                );
+                if is_dy_diff_ignored(grid, source_point) {
+                    continue;
+                }
+
+                let generated = image.get_pixel(x, y).0;
+                let generated_black = generated[0] < 96 && generated[1] < 96 && generated[2] < 96;
+                let original_black =
+                    source.is_black(source_point.0.round() as i32, source_point.1.round() as i32);
+                if original_black == generated_black {
+                    continue;
+                }
+
+                let Some(ring_idx) = no_border_nearest_ring_index(grid, source_point) else {
+                    continue;
+                };
+                let radial_delta =
+                    no_border_ring_radial_delta(&grid.rings[ring_idx], source_point, grid.center);
+                let ring_stats = &mut stats[ring_idx];
+                ring_stats.total += 1;
+                if original_black {
+                    ring_stats.red += 1;
+                    ring_stats.red_radial_sum += radial_delta;
+                } else {
+                    ring_stats.blue += 1;
+                    ring_stats.blue_radial_sum += radial_delta;
+                }
+            }
+        }
+
+        stats
+    }
+
+    fn no_border_ring_radial_delta(ring: &RingSpec, point: (f64, f64), center: (f64, f64)) -> f64 {
+        let radius = (point.0 - center.0).hypot(point.1 - center.1);
+        let ring_radius = (ring.r_inner + ring.r_outer) * 0.5;
+        radius - ring_radius
+    }
+
+    fn no_border_nearest_ring_index(grid: &DyGrid, point: (f64, f64)) -> Option<usize> {
+        let radius = (point.0 - grid.center.0).hypot(point.1 - grid.center.1);
+        grid.rings
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, ring)| {
+                let ring_radius = (ring.r_inner + ring.r_outer) * 0.5;
+                let half_width = (ring.r_outer - ring.r_inner) * 0.5;
+                let distance = (radius - ring_radius).abs();
+                let slack = half_width * if ring.is_decoration { 2.1 } else { 1.7 };
+                (distance <= slack.max(1.0)).then_some((idx, distance))
+            })
+            .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
+            .map(|(idx, _)| idx)
+    }
+
+    fn no_border_black_samples_by_ring(grid: &DyGrid) -> Vec<usize> {
+        (0..grid.rings.len() as u32)
+            .map(|ring| {
+                (0..grid.points_per_ring)
+                    .filter(|&point| grid.sample(ring, point))
+                    .count()
+            })
+            .collect()
+    }
+
+    fn no_border_radius_scale_summary(grid: &DyGrid) -> String {
+        const STANDARD_RADII: [f64; 6] = [
+            229.78129202897986,
+            209.6213360594897,
+            190.12287822447763,
+            171.44589181206953,
+            152.35786834266318,
+            133.26960322367916,
+        ];
+        let locator_scale = grid_locator_distance(grid) / DOUYIN_NO_BORDER_LOCATOR_DISTANCE;
+        grid.rings
+            .iter()
+            .zip(STANDARD_RADII)
+            .map(|(ring, standard_radius)| {
+                let radius = (ring.r_inner + ring.r_outer) * 0.5;
+                format!("{:.4}", radius / (standard_radius * locator_scale).max(1.0))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_render_geometry_search() {
+        use crate::codec::dy_grid::{detect_dy_params, sample_dy_with_logos};
+        use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::pipeline::preprocess::preprocess;
+
+        let fixtures = sample_paths(&["无框版"])
+            .into_iter()
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| {
+                        matches!(stem, "无框版1" | "无框版4" | "无框版6" | "无框版10")
+                    })
+            })
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                (path, corrected_binary, grid)
+            })
+            .collect::<Vec<_>>();
+
+        let mut totals = Vec::new();
+        for spread_step in 92..=102 {
+            let spread = f64::from(spread_step) / 100.0;
+            let mut total = 0_u32;
+            let mut max_diff = 0_u32;
+            let mut per_sample = Vec::new();
+
+            for (_, corrected_binary, grid) in &fixtures {
+                let mut candidate = grid.clone();
+                apply_no_border_radial_spread(&mut candidate, spread);
+                let (_, diff_count) =
+                    dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 512);
+                total += diff_count;
+                max_diff = max_diff.max(diff_count);
+                per_sample.push(diff_count);
+            }
+
+            totals.push((total, max_diff, spread, per_sample));
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _)| (total, max_diff));
+        for (total, max_diff, spread, per_sample) in totals.into_iter().take(8) {
+            println!("spread={spread:.2} total={total} max={max_diff} per_sample={per_sample:?}");
+        }
+    }
+
+    fn apply_no_border_radial_spread(grid: &mut DyGrid, spread: f64) {
+        const STANDARD_RADII: [f64; 6] = [
+            229.78129202897986,
+            209.6213360594897,
+            190.12287822447763,
+            171.44589181206953,
+            152.35786834266318,
+            133.26960322367916,
+        ];
+        let locator_scale = grid_locator_distance(grid) / DOUYIN_NO_BORDER_LOCATOR_DISTANCE;
+        let Some(first_ring) = grid.rings.first() else {
+            return;
+        };
+        let current_first_radius = (first_ring.r_inner + first_ring.r_outer) * 0.5;
+        let radius_scale = current_first_radius / (STANDARD_RADII[0] * locator_scale).max(1.0);
+        let standard_midpoint = (STANDARD_RADII[0] + STANDARD_RADII[5]) * 0.5;
+
+        for (ring, standard_radius) in grid.rings.iter_mut().zip(STANDARD_RADII) {
+            let half_width = (ring.r_outer - ring.r_inner) * 0.5;
+            let adjusted_radius =
+                standard_midpoint + (standard_radius - standard_midpoint) * spread;
+            let radius = adjusted_radius * locator_scale * radius_scale;
+            ring.r_inner = (radius - half_width).max(0.0);
+            ring.r_outer = radius + half_width;
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_render_style_search() {
+        let fixtures = no_border_debug_fixtures();
+        let mut totals = Vec::new();
+
+        for spread_step in [998, 1000] {
+            for code_width_step in [88, 94, 100] {
+                for decorative_width_step in [110, 130, 150] {
+                    for inset_step in [56, 64, 72] {
+                        let style = NoBorderRenderSearchStyle {
+                            spread: f64::from(spread_step) / 1000.0,
+                            code_width_scale: f64::from(code_width_step) / 100.0,
+                            decorative_width_scale: f64::from(decorative_width_step) / 100.0,
+                            multi_run_angular_inset: f64::from(inset_step) / 100.0,
+                        };
+                        let mut total = 0_u32;
+                        let mut max_diff = 0_u32;
+                        let mut per_sample = Vec::new();
+
+                        for (_, corrected_binary, grid) in &fixtures {
+                            let diff_count = no_border_diff_count_with_search_style(
+                                grid,
+                                corrected_binary,
+                                style,
+                            );
+                            total += diff_count;
+                            max_diff = max_diff.max(diff_count);
+                            per_sample.push(diff_count);
+                        }
+
+                        totals.push((total, max_diff, style, per_sample));
+                    }
+                }
+            }
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _)| (total, max_diff));
+        for (total, max_diff, style, per_sample) in totals.into_iter().take(12) {
+            println!(
+                "spread={:.3} code_width={:.2} decorative_width={:.2} inset={:.2} total={} max={} per_sample={:?}",
+                style.spread,
+                style.code_width_scale,
+                style.decorative_width_scale,
+                style.multi_run_angular_inset,
+                total,
+                max_diff,
+                per_sample
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_center_offset_search() {
+        let fixtures = no_border_debug_fixtures();
+        let mut totals = Vec::new();
+
+        for dx_step in -4..=4 {
+            for dy_step in -4..=4 {
+                let mut total = 0_u32;
+                let mut max_diff = 0_u32;
+                let mut per_sample = Vec::new();
+                let dx = f64::from(dx_step);
+                let dy = f64::from(dy_step);
+
+                for (_, corrected_binary, grid) in &fixtures {
+                    let mut candidate = grid.clone();
+                    candidate.center.0 += dx;
+                    candidate.center.1 += dy;
+                    let (_, diff_count) =
+                        dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+                    total += diff_count;
+                    max_diff = max_diff.max(diff_count);
+                    per_sample.push(diff_count);
+                }
+
+                totals.push((total, max_diff, dx, dy, per_sample));
+            }
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (total, max_diff));
+        println!("best by total");
+        for (total, max_diff, dx, dy, per_sample) in totals.iter().take(16) {
+            println!(
+                "dx={dx:.1} dy={dy:.1} total={total} max={max_diff} per_sample={per_sample:?}"
+            );
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (max_diff, total));
+        println!("best by max");
+        for (total, max_diff, dx, dy, per_sample) in totals.into_iter().take(16) {
+            println!(
+                "dx={dx:.1} dy={dy:.1} total={total} max={max_diff} per_sample={per_sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_direct_diff_outputs() {
+        use crate::codec::dy_grid::{detect_dy_params, sample_dy_with_logos};
+        use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+        use crate::pipeline::preprocess::preprocess;
+
+        let out_dir = std::path::Path::new("target/debug/no_border_direct_debug");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        for path in sample_paths(&["无框版"]) {
+            let img = image::open(&path).unwrap();
+            let bin = preprocess(&img);
+            let finders = find_dy_finders(&bin);
+            let selected = select_dy_finders_raw(&finders)
+                .unwrap_or_else(|| panic!("failed to select dy finders for {}", path.display()));
+            let params = detect_dy_params(&bin, &selected).unwrap();
+            let grid = sample_dy_with_logos(&bin, &img, &selected, params).unwrap();
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            let (diff, diff_count) = dy_grid_to_diff_preview_image(&grid, &bin, true, 1024);
+            std::fs::write(out_dir.join(format!("{stem}.svg")), dy_grid_to_svg(&grid)).unwrap();
+            diff.save(out_dir.join(format!("{stem}_diff.png"))).unwrap();
+            println!(
+                "direct dy {stem} rings={} points={} diff_count={diff_count}",
+                grid.ring_count(),
+                grid.points_per_ring
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_no_badge_warp_diff_outputs() {
+        use crate::codec::dy_grid::{detect_dy_params, sample_dy_with_logos};
+        use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+        use crate::pipeline::perspective::{
+            dy_upright_target_finders, warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::pipeline::preprocess::preprocess;
+
+        for path in sample_paths(&["无框版"]) {
+            let img = image::open(&path).unwrap();
+            let raw_binary = preprocess(&img);
+            let raw_finders = find_dy_finders(&raw_binary);
+            let raw_selected = select_dy_finders_raw(&raw_finders)
+                .unwrap_or_else(|| panic!("failed to select dy finders for {}", path.display()));
+            let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+            let corrected_source =
+                warp_dy_to_upright_image_with_top_right(&img, &raw_selected, None, correction_size);
+            let corrected_binary = preprocess(&corrected_source);
+            let selected = dy_upright_target_finders(&raw_selected, correction_size);
+            let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+            let grid =
+                sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                    .unwrap();
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            let (_, diff_count) =
+                dy_grid_to_diff_preview_image(&grid, &corrected_binary, false, 1024);
+            println!(
+                "no_badge_warp dy {stem} rings={} points={} diff_count={diff_count}",
+                grid.ring_count(),
+                grid.points_per_ring
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_badge_offset_search() {
+        use crate::codec::dy_grid::{detect_dy_params, sample_dy_with_logos};
+        use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right_offset,
+        };
+        use crate::pipeline::preprocess::preprocess;
+
+        let fixtures = sample_paths(&["无框版"])
+            .into_iter()
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select dy finders for {}", path.display())
+                });
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    img,
+                    raw_selected,
+                    top_right,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let candidates = [
+            // Current production constants.
+            (0.0270, -0.0250),
+            // Standard no-border SVG geometry: badge center relative to virtual top-right finder.
+            (0.0267, -0.0272),
+            (0.0270, -0.0270),
+            (0.0260, -0.0270),
+            (0.0280, -0.0270),
+            (0.0270, -0.0290),
+        ];
+        let mut totals = Vec::new();
+        for (dx, dy) in candidates {
+            let mut total = 0_u32;
+            let mut max_diff = 0_u32;
+            let mut per_sample = Vec::new();
+
+            for (_, img, raw_selected, top_right) in &fixtures {
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let corrected_source = warp_dy_to_upright_image_with_top_right_offset(
+                    img,
+                    raw_selected,
+                    *top_right,
+                    correction_size,
+                    dx,
+                    dy,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let (_, diff_count) =
+                    dy_grid_to_diff_preview_image(&grid, &corrected_binary, false, 384);
+                total += diff_count;
+                max_diff = max_diff.max(diff_count);
+                per_sample.push(diff_count);
+            }
+
+            totals.push((total, max_diff, dx, dy, per_sample));
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (total, max_diff));
+        println!("best by total");
+        for (total, max_diff, dx, dy, per_sample) in totals.iter().take(12) {
+            println!(
+                "dx={dx:.3} dy={dy:.3} total={total} max={max_diff} per_sample={per_sample:?}"
+            );
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (max_diff, total));
+        println!("best by max");
+        for (total, max_diff, dx, dy, per_sample) in totals.into_iter().take(12) {
+            println!(
+                "dx={dx:.3} dy={dy:.3} total={total} max={max_diff} per_sample={per_sample:?}"
+            );
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct NoBorderRenderSearchStyle {
+        spread: f64,
+        code_width_scale: f64,
+        decorative_width_scale: f64,
+        multi_run_angular_inset: f64,
+    }
+
+    fn no_border_debug_fixtures() -> Vec<(String, BinaryImage, DyGrid)> {
+        use crate::codec::dy_grid::{detect_dy_params, sample_dy_with_logos};
+        use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::pipeline::preprocess::preprocess;
+
+        sample_paths(&["无框版"])
+            .into_iter()
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    grid,
+                )
+            })
+            .collect()
+    }
+
+    fn no_border_diff_count_with_search_style(
+        grid: &DyGrid,
+        source: &BinaryImage,
+        style: NoBorderRenderSearchStyle,
+    ) -> u32 {
+        let mut candidate = grid.clone();
+        apply_no_border_radial_spread(&mut candidate, style.spread);
+        let image = no_border_preview_with_search_style(&candidate, 320, style).to_rgba8();
+        let layout = DOUYIN_NO_BORDER_LAYOUT;
+        let transform = preview_fit_transform(layout.viewbox, image.width().max(1));
+        let svg_scale =
+            DOUYIN_NO_BORDER_LOCATOR_DISTANCE / grid_locator_distance(&candidate).max(1.0);
+        let rotation = candidate.theta_offset - layout.code_theta_offset;
+        let mut diff_count = 0_u32;
+
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                let layout_point = transform.inverse_point((x as f64 + 0.5, y as f64 + 0.5));
+                let source_point = no_border_layout_to_source_point(
+                    &candidate,
+                    layout,
+                    svg_scale,
+                    rotation,
+                    layout_point,
+                );
+                if is_dy_diff_ignored(&candidate, source_point) {
+                    continue;
+                }
+
+                let generated = image.get_pixel(x, y).0;
+                let generated_black = generated[0] < 96 && generated[1] < 96 && generated[2] < 96;
+                let original_black =
+                    source.is_black(source_point.0.round() as i32, source_point.1.round() as i32);
+                if original_black != generated_black {
+                    diff_count += 1;
+                }
+            }
+        }
+
+        diff_count
+    }
+
+    fn no_border_preview_with_search_style(
+        grid: &DyGrid,
+        size: u32,
+        style: NoBorderRenderSearchStyle,
+    ) -> DynamicImage {
+        let mut image = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
+        let layout = DOUYIN_NO_BORDER_LAYOUT;
+        let transform = preview_fit_transform(layout.viewbox, size);
+
+        if grid.points_per_ring != 0 && !grid.rings.is_empty() {
+            let svg_scale =
+                DOUYIN_NO_BORDER_LOCATOR_DISTANCE / grid_locator_distance(grid).max(1.0);
+            let render_scale = transform.scale * svg_scale;
+            let center = transform.point(layout.center);
+            let theta_step = std::f64::consts::TAU / grid.points_per_ring as f64;
+            for (ring_idx, ring) in grid.rings.iter().enumerate() {
+                for run in dy_sample_runs(grid, ring_idx as u32) {
+                    let Some(mark) = dy_mark_geometry_with_search_style(
+                        layout.code_theta_offset,
+                        ring,
+                        run,
+                        theta_step,
+                        style,
+                    ) else {
+                        continue;
+                    };
+                    if run.len() == 1 {
+                        let point =
+                            polar_point_px(center, mark.radius * render_scale, mark.theta_mid());
+                        paint_filled_circle(
+                            &mut image,
+                            point,
+                            mark.stroke_width * render_scale * 0.5,
+                            Rgba([0, 0, 0, 255]),
+                        );
+                    } else {
+                        paint_arc_stroke_xy(
+                            &mut image,
+                            center,
+                            render_scale,
+                            RasterArcStroke {
+                                radius: mark.radius,
+                                theta_start: mark.theta_start,
+                                theta_end: mark.theta_end,
+                                stroke_radius: mark.stroke_width * render_scale * 0.5,
+                            },
+                            Rgba([0, 0, 0, 255]),
+                        );
+                    }
+                }
+            }
+        }
+
+        paint_no_border_static_marks(&mut image, layout, transform);
+        DynamicImage::ImageRgba8(image)
+    }
+
+    fn dy_mark_geometry_with_search_style(
+        theta_offset: f64,
+        ring: &RingSpec,
+        run: DyRun,
+        theta_step: f64,
+        style: NoBorderRenderSearchStyle,
+    ) -> Option<DyMarkGeometry> {
+        let run_len = run.end.checked_sub(run.start)?;
+        if run_len == 0 {
+            return None;
+        }
+
+        let radial_step = (ring.r_outer - ring.r_inner).max(0.01);
+        let radius = (ring.r_inner + ring.r_outer) * 0.5;
+        let stroke_width = if ring.is_decoration && run_len > 1 {
+            radial_step * style.decorative_width_scale
+        } else if run_len > 1 {
+            radial_step * style.code_width_scale
+        } else {
+            radial_step
+        };
+        let angular_inset = theta_step
+            * if run_len == 1 {
+                0.26
+            } else {
+                style.multi_run_angular_inset
+            };
+        let theta_start = theta_offset + run.start as f64 * theta_step + angular_inset;
+        let theta_end = theta_offset + run.end as f64 * theta_step - angular_inset;
+        if theta_end <= theta_start {
+            return None;
+        }
+
+        let half_width = stroke_width * 0.5;
+        Some(DyMarkGeometry {
+            radius,
+            stroke_width,
+            r_inner: (radius - half_width).max(0.0),
+            r_outer: radius + half_width,
+            theta_start,
+            theta_end,
+        })
     }
 
     fn dy_black_samples_by_ring(grid: &DyGrid) -> Vec<usize> {

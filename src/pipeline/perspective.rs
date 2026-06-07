@@ -18,8 +18,8 @@ pub struct DyBadgeAnchor {
     pub radius: f64,
 }
 
-const DY_BADGE_CENTER_DX_PER_LOCATOR_LEG: f64 = 8.78 / 369.71;
-const DY_BADGE_CENTER_DY_PER_LOCATOR_LEG: f64 = -9.32 / 369.71;
+const DY_BADGE_CENTER_DX_PER_LOCATOR_LEG: f64 = 0.0270;
+const DY_BADGE_CENTER_DY_PER_LOCATOR_LEG: f64 = -0.0250;
 
 /// Warps a detected QR code into a square binary image of `target_size`.
 #[cfg(test)]
@@ -285,6 +285,47 @@ pub fn warp_dy_to_upright_image_with_top_right(
 ) -> DynamicImage {
     let size = target_size.max(1);
     let Some(inv) = dy_upright_to_source_homography(finders, top_right, size) else {
+        return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            size,
+            size,
+            Rgba([255, 255, 255, 255]),
+        ));
+    };
+
+    let source = image.to_rgba8();
+    let mut out = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
+    for y in 0..size {
+        for x in 0..size {
+            let p = inv * Vector3::new(x as f64, y as f64, 1.0);
+            if p.z.abs() < f64::EPSILON {
+                continue;
+            }
+            let sx = p.x / p.z;
+            let sy = p.y / p.z;
+            out.put_pixel(x, y, bilinear_sample_rgba(&source, sx, sy));
+        }
+    }
+
+    DynamicImage::ImageRgba8(out)
+}
+
+#[cfg(test)]
+pub fn warp_dy_to_upright_image_with_top_right_offset(
+    image: &DynamicImage,
+    finders: &[DyFinder; 3],
+    top_right: Option<(f64, f64)>,
+    target_size: u32,
+    dx_per_locator_leg: f64,
+    dy_per_locator_leg: f64,
+) -> DynamicImage {
+    let size = target_size.max(1);
+    let Some(inv) = dy_upright_to_source_homography_with_badge_offset(
+        finders,
+        top_right,
+        size,
+        dx_per_locator_leg,
+        dy_per_locator_leg,
+    ) else {
         return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
             size,
             size,
@@ -737,6 +778,22 @@ fn dy_upright_to_source_homography(
     top_right: Option<(f64, f64)>,
     target_size: u32,
 ) -> Option<Matrix3<f64>> {
+    dy_upright_to_source_homography_with_badge_offset(
+        finders,
+        top_right,
+        target_size,
+        DY_BADGE_CENTER_DX_PER_LOCATOR_LEG,
+        DY_BADGE_CENTER_DY_PER_LOCATOR_LEG,
+    )
+}
+
+fn dy_upright_to_source_homography_with_badge_offset(
+    finders: &[DyFinder; 3],
+    top_right: Option<(f64, f64)>,
+    target_size: u32,
+    dx_per_locator_leg: f64,
+    dy_per_locator_leg: f64,
+) -> Option<Matrix3<f64>> {
     let ordered = order_dy_finders(finders);
     let tl = &ordered[0];
     let bl = &ordered[1];
@@ -748,8 +805,8 @@ fn dy_upright_to_source_homography(
     let target_leg = far - margin;
     let tr_dst = if top_right.is_some() {
         (
-            far + DY_BADGE_CENTER_DX_PER_LOCATOR_LEG * target_leg,
-            margin + DY_BADGE_CENTER_DY_PER_LOCATOR_LEG * target_leg,
+            far + dx_per_locator_leg * target_leg,
+            margin + dy_per_locator_leg * target_leg,
         )
     } else {
         (far, margin)

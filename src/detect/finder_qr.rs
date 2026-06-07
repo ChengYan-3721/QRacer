@@ -8,6 +8,19 @@ pub struct QrFinder {
     pub module: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QrLatticeSignature {
+    pub finder: f64,
+    pub timing: f64,
+    pub separator: f64,
+}
+
+impl QrLatticeSignature {
+    pub fn is_confident(self) -> bool {
+        self.finder >= 0.58 && self.timing >= 0.72 && self.separator >= 0.70
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Run {
     black: bool,
@@ -82,7 +95,8 @@ pub fn select_qr_finder_triplet(bin: &BinaryImage, finders: &[QrFinder]) -> Opti
         return None;
     }
 
-    let mut best: Option<(f64, [QrFinder; 3])> = None;
+    let mut best_confident: Option<(f64, [QrFinder; 3])> = None;
+    let mut best_fallback: Option<(f64, [QrFinder; 3])> = None;
     for a in 0..finders.len() - 2 {
         for b in a + 1..finders.len() - 1 {
             for c in b + 1..finders.len() {
@@ -91,14 +105,57 @@ pub fn select_qr_finder_triplet(bin: &BinaryImage, finders: &[QrFinder]) -> Opti
                     continue;
                 };
 
-                if best.is_none_or(|(best_score, _)| score > best_score) {
-                    best = Some((score, triplet));
+                if qr_lattice_signature(bin, &triplet)
+                    .is_some_and(|signature| signature.is_confident())
+                {
+                    if best_confident.is_none_or(|(best_score, _)| score > best_score) {
+                        best_confident = Some((score, triplet));
+                    }
+                } else if best_fallback.is_none_or(|(best_score, _)| score > best_score) {
+                    best_fallback = Some((score, triplet));
                 }
             }
         }
     }
 
-    best.map(|(_, triplet)| triplet)
+    best_confident.or(best_fallback).map(|(_, triplet)| triplet)
+}
+
+pub fn qr_lattice_signature(
+    bin: &BinaryImage,
+    finders: &[QrFinder; 3],
+) -> Option<QrLatticeSignature> {
+    let (tl, tr, bl) = order_finder_triplet(*finders);
+    let module = ((tl.module + tr.module + bl.module) / 3.0).max(1.0);
+    let horizontal_modules = squared_distance(tl, tr).sqrt() / module + 7.0;
+    let vertical_modules = squared_distance(tl, bl).sqrt() / module + 7.0;
+    let modules = ((horizontal_modules + vertical_modules) * 0.5)
+        .round()
+        .clamp(21.0, 177.0) as i32;
+    if modules < 21 {
+        return None;
+    }
+
+    let u_axis = unit_vector(tl, tr, module);
+    let v_axis = unit_vector(tl, bl, module);
+    let finder = [
+        finder_template_score(bin, tl, u_axis, v_axis),
+        finder_template_score(bin, tr, u_axis, v_axis),
+        finder_template_score(bin, bl, u_axis, v_axis),
+    ]
+    .iter()
+    .sum::<f64>()
+        / 3.0;
+    let timing = (timing_axis_score(bin, tl, u_axis, v_axis, modules)
+        + timing_axis_score(bin, tl, v_axis, u_axis, modules))
+        * 0.5;
+    let separator = separator_score(bin, tl, u_axis, v_axis, modules);
+
+    Some(QrLatticeSignature {
+        finder,
+        timing,
+        separator,
+    })
 }
 
 fn score_finder_triplet(bin: &BinaryImage, finders: [QrFinder; 3]) -> Option<f64> {
@@ -161,7 +218,6 @@ fn score_finder_triplet(bin: &BinaryImage, finders: [QrFinder; 3]) -> Option<f64
     }
     let finder_score = finder_scores.iter().sum::<f64>() / finder_scores.len() as f64;
     let timing_score = timing_pattern_score(bin, tl, tr, bl);
-
     let normalized_area = area / (avg_module * avg_module);
     Some(
         normalized_area
@@ -277,6 +333,39 @@ fn timing_axis_score(
     }
 
     matches as f64 / total as f64
+}
+
+fn separator_score(
+    bin: &BinaryImage,
+    tl: QrFinder,
+    u_axis: (f64, f64),
+    v_axis: (f64, f64),
+    modules: i32,
+) -> f64 {
+    let mut white = 0_u32;
+    let mut total = 0_u32;
+
+    for i in 0..8 {
+        for (x, y) in [
+            (i, 7),
+            (7, i),
+            (modules - 8, i),
+            (modules - 1 - i, 7),
+            (i, modules - 8),
+            (7, modules - 1 - i),
+        ] {
+            let point = (
+                tl.cx + u_axis.0 * (x as f64 - 3.0) + v_axis.0 * (y as f64 - 3.0),
+                tl.cy + u_axis.1 * (x as f64 - 3.0) + v_axis.1 * (y as f64 - 3.0),
+            );
+            if bilinear_sample(bin, point.0, point.1) >= 128.0 {
+                white += 1;
+            }
+            total += 1;
+        }
+    }
+
+    white as f64 / total.max(1) as f64
 }
 
 fn row_runs(bin: &BinaryImage, y: u32) -> Vec<Run> {
@@ -558,6 +647,44 @@ mod tests {
                 (finder.cx - expected.cx).abs() < f64::EPSILON
                     && (finder.cy - expected.cy).abs() < f64::EPSILON
             }));
+        }
+    }
+
+    #[test]
+    fn selects_xiaohongshu_true_finders_over_data_dot_candidates() {
+        for path in [
+            "samples/小红书QR码1.jpg",
+            "samples/小红书QR码1放大.png",
+            "samples/小红书QR码1缩小.png",
+            "samples/小红书QR码2.jpg",
+            "samples/小红书QR码2放大a.png",
+            "samples/小红书QR码2放大b.png",
+            "samples/小红书QR码2放大c.png",
+            "samples/小红书QR码2缩小.png",
+        ] {
+            if !std::path::Path::new(path).exists() {
+                continue;
+            }
+
+            let img = image::open(path).unwrap();
+            let bin = crate::pipeline::preprocess::preprocess(&img);
+            let finders = find_qr_finders(&bin);
+            let selected = select_qr_finder_triplet(&bin, &finders).expect(path);
+            let lattice = qr_lattice_signature(&bin, &selected).expect(path);
+            assert!(lattice.is_confident(), "{path}: {lattice:?}");
+
+            let (tl, tr, bl) = order_finder_triplet(selected);
+            let module = ((tl.module + tr.module + bl.module) / 3.0).max(1.0);
+            let horizontal_modules = squared_distance(tl, tr).sqrt() / module + 7.0;
+            let vertical_modules = squared_distance(tl, bl).sqrt() / module + 7.0;
+            assert!(
+                (horizontal_modules - 33.0).abs() < 1.0,
+                "{path}: horizontal modules {horizontal_modules}"
+            );
+            assert!(
+                (vertical_modules - 33.0).abs() < 1.0,
+                "{path}: vertical modules {vertical_modules}"
+            );
         }
     }
 

@@ -8,7 +8,7 @@
 
 use crate::code_kind::CodeKind;
 use crate::codec::dy_grid::{DyGrid, detect_dy_params, sample_dy, sample_dy_with_logos};
-use crate::codec::qr::{QrDecoded, QrMatrix, decode_qr, regenerate_qr};
+use crate::codec::qr::{QrDecoded, QrEcc, QrMatrix, decode_qr, regenerate_qr};
 use crate::codec::qr_grid::{infer_qr_version, sample_qr_grid};
 use crate::codec::wx_grid::{WxGrid, detect_wx_version, sample_wx, sample_wx_with_badge};
 use crate::detect;
@@ -26,13 +26,14 @@ use crate::pipeline::perspective::{
 use crate::pipeline::preprocess::{BinaryImage, preprocess};
 use crate::screen_capture;
 use crate::ui;
-use crate::vector::diff::{DiffResult, compute_matrix_diff, render_qr_diff_preview};
+use crate::vector::diff::{DiffResult, compute_matrix_diff};
 use crate::vector::svg::{
-    dy_grid_to_diff_preview_image, dy_grid_to_preview_image, dy_grid_to_svg, qr_matrix_to_svg,
+    QrAppearance, dy_grid_to_diff_preview_image, dy_grid_to_preview_image, dy_grid_to_svg,
+    qr_matrix_to_preview_image, qr_matrix_to_svg, qr_matrix_to_svg_with_appearance,
     wx_grid_to_diff_preview_image, wx_grid_to_preview_image, wx_grid_to_svg,
 };
 use eframe::egui;
-use image::DynamicImage;
+use image::{DynamicImage, GrayImage};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,6 +99,8 @@ pub struct QRacerApp {
     pub warped: Option<BinaryImage>,
     /// Stage 3 selected QR mask regeneration mode.
     pub mask_choice: MaskChoice,
+    /// Visual style used for QR SVG output and generated preview.
+    pub qr_appearance: QrAppearance,
     /// Stage 3 last successful QR decode result.
     pub last_decoded: Option<QrDecoded>,
     /// Last inferred QR version, available even when payload decoding fails.
@@ -147,6 +150,7 @@ struct ProcessResult {
     finders: Option<Vec<QrFinder>>,
     warped: Option<BinaryImage>,
     mask_choice: MaskChoice,
+    qr_appearance: QrAppearance,
     last_decoded: Option<QrDecoded>,
     qr_version: Option<u8>,
     last_matrix: Option<QrMatrix>,
@@ -172,6 +176,7 @@ impl QRacerApp {
             finders: None,
             warped: None,
             mask_choice: MaskChoice::Mask(0),
+            qr_appearance: QrAppearance::Standard,
             last_decoded: None,
             qr_version: None,
             last_matrix: None,
@@ -210,6 +215,7 @@ impl QRacerApp {
         self.finders = None;
         self.warped = None;
         self.mask_choice = MaskChoice::Mask(0);
+        self.qr_appearance = QrAppearance::Standard;
         self.last_decoded = None;
         self.qr_version = None;
         self.last_matrix = None;
@@ -315,7 +321,7 @@ impl QRacerApp {
 
         self.mask_choice = MaskChoice::Mask(candidate.mask);
         self.matched_mask = Some(candidate.mask);
-        let svg = qr_matrix_to_svg(&candidate.matrix, 1.0);
+        let svg = self.qr_svg_for_matrix(&candidate.matrix);
         self.set_generated_artifacts(candidate.matrix, svg);
     }
 
@@ -352,7 +358,7 @@ impl QRacerApp {
                 let matrix = self.stabilize_grid_matrix(matrix);
                 self.qr_version = Some(version);
                 self.mask_choice = MaskChoice::GridFallback;
-                let svg = qr_matrix_to_svg(&matrix, 1.0);
+                let svg = self.qr_svg_for_matrix(&matrix);
                 self.set_generated_artifacts(matrix, svg);
             }
             Err(error) => {
@@ -609,7 +615,7 @@ impl QRacerApp {
 
         match regenerate_qr(&decoded, mask) {
             Ok(matrix) => {
-                let svg = qr_matrix_to_svg(&matrix, 1.0);
+                let svg = self.qr_svg_for_matrix(&matrix);
                 self.set_generated_artifacts(matrix, svg);
             }
             Err(error) => {
@@ -619,6 +625,28 @@ impl QRacerApp {
                 self.last_diff_count = None;
                 self.status = format!("QR 重生成失败：{error}");
             }
+        }
+    }
+
+    pub fn can_switch_qr_appearance(&self) -> bool {
+        self.code_kind == CodeKind::Qr && self.last_matrix.is_some()
+    }
+
+    pub fn set_qr_appearance(&mut self, appearance: QrAppearance) {
+        if self.qr_appearance == appearance {
+            return;
+        }
+        self.qr_appearance = appearance;
+        if let Some(matrix) = self.last_matrix.clone() {
+            self.last_svg = Some(self.qr_svg_for_matrix(&matrix));
+            self.refresh_generated_preview();
+        }
+    }
+
+    fn qr_svg_for_matrix(&self, matrix: &QrMatrix) -> String {
+        match self.qr_appearance {
+            QrAppearance::Standard => qr_matrix_to_svg(matrix, 1.0),
+            appearance => qr_matrix_to_svg_with_appearance(matrix, 1.0, appearance),
         }
     }
 
@@ -721,11 +749,17 @@ impl QRacerApp {
         let diff_count = diff.as_ref().map(|diff| diff.diff_count).unwrap_or(0);
         let modules = matrix.len().max(1) as u32;
         let scale = (PREVIEW_SIZE / modules).max(2);
-        let preview =
-            render_qr_diff_preview(matrix, diff.as_ref(), self.show_diff_overlay, scale, 0);
+        let preview = qr_matrix_to_preview_image(
+            matrix,
+            self.qr_appearance,
+            diff.as_ref(),
+            self.show_diff_overlay,
+            scale,
+            0,
+        );
         let preview_name = match self.mask_choice {
-            MaskChoice::Mask(mask) => format!("preview-mask-{mask}"),
-            MaskChoice::GridFallback => String::from("preview-grid-fallback"),
+            MaskChoice::Mask(mask) => format!("preview-mask-{mask}-{:?}", self.qr_appearance),
+            MaskChoice::GridFallback => format!("preview-grid-fallback-{:?}", self.qr_appearance),
         };
         self.preview = Some(LoadedImage::from_dynamic(preview_name, preview));
         self.last_diff_count = Some(diff_count);
@@ -818,6 +852,7 @@ impl QRacerApp {
         self.finders = result.finders;
         self.warped = result.warped;
         self.mask_choice = result.mask_choice;
+        self.qr_appearance = result.qr_appearance;
         self.last_decoded = result.last_decoded;
         self.qr_version = result.qr_version;
         self.last_matrix = result.last_matrix;
@@ -844,6 +879,7 @@ fn process_image(img: DynamicImage, job_id: u64, show_diff_overlay: bool) -> Pro
         finders: None,
         warped: None,
         mask_choice: MaskChoice::Mask(0),
+        qr_appearance: QrAppearance::Standard,
         last_decoded: None,
         qr_version: None,
         last_matrix: None,
@@ -885,9 +921,9 @@ fn process_qr_image(
         result.finders = Some(finders);
         return;
     };
-
     let corrected_source = warp_qr_to_square_image(img, binary, &selected, PREVIEW_SIZE);
     let warped = preprocess(&corrected_source);
+    result.qr_appearance = infer_qr_appearance(img, &selected, &warped);
     result.preview = Some((
         format!("preview-qr-corrected-{job_id}"),
         warped.to_dynamic_image(),
@@ -899,7 +935,6 @@ fn process_qr_image(
     match decode_qr(img, Some(&warped)) {
         Ok(decoded) => {
             result.qr_version = Some(decoded.version);
-            result.last_decoded = Some(decoded.clone());
             let reference_matrix = sample_qr_grid(&warped, decoded.version).ok();
             result.qr_reference_matrix = reference_matrix.clone();
 
@@ -907,14 +942,19 @@ fn process_qr_image(
                 .as_ref()
                 .and_then(|reference| choose_matching_qr_mask(&decoded, reference))
             {
+                let mut decoded = decoded.clone();
+                decoded.ecc = candidate.ecc;
                 let mask = candidate.mask;
+                result.last_decoded = Some(decoded.clone());
                 result.mask_choice = MaskChoice::Mask(mask);
                 result.matched_mask = Some(mask);
-                let svg = qr_matrix_to_svg(&candidate.matrix, 1.0);
+                let svg =
+                    qr_matrix_to_svg_with_appearance(&candidate.matrix, 1.0, result.qr_appearance);
                 let (preview_name, preview, diff_count) = qr_preview_for_matrix(
                     &candidate.matrix,
                     reference_matrix.as_ref(),
                     result.mask_choice,
+                    result.qr_appearance,
                     show_diff_overlay,
                     job_id,
                 );
@@ -924,15 +964,18 @@ fn process_qr_image(
                 result.preview = Some((preview_name, preview));
                 result.status = qr_mask_status_text(&decoded, mask, Some(mask), diff_count, 0);
             } else {
+                result.last_decoded = Some(decoded.clone());
                 result.matched_mask = None;
                 result.mask_choice = MaskChoice::GridFallback;
                 match reference_matrix {
                     Some(matrix) => {
-                        let svg = qr_matrix_to_svg(&matrix, 1.0);
+                        let svg =
+                            qr_matrix_to_svg_with_appearance(&matrix, 1.0, result.qr_appearance);
                         let (preview_name, preview, diff_count) = qr_preview_for_matrix(
                             &matrix,
                             result.qr_reference_matrix.as_ref(),
                             result.mask_choice,
+                            result.qr_appearance,
                             show_diff_overlay,
                             job_id,
                         );
@@ -955,6 +998,19 @@ fn process_qr_image(
             }
         }
         Err(error) => {
+            if let Ok(version) = try_use_decodeless_qr_grid_fallback(
+                &warped,
+                &selected,
+                result,
+                show_diff_overlay,
+                job_id,
+            ) {
+                result.status = format!(
+                    "已完成 QR 校正并推断版本 V{version}，但解码失败：{error}；已自动使用网格像素匹配"
+                );
+                return;
+            }
+
             result.status = if let Some(version) = result.qr_version {
                 format!(
                     "已完成 QR 校正并推断版本 V{version}，但解码失败：{error}；可使用网格像素匹配"
@@ -964,6 +1020,41 @@ fn process_qr_image(
             };
         }
     }
+}
+
+fn try_use_decodeless_qr_grid_fallback(
+    warped: &BinaryImage,
+    finders: &[QrFinder; 3],
+    result: &mut ProcessResult,
+    show_diff_overlay: bool,
+    job_id: u64,
+) -> Result<u8, String> {
+    let version = result
+        .qr_version
+        .or_else(|| infer_qr_version(warped).ok())
+        .or_else(|| estimate_qr_modules_from_finders(finders).and_then(qr_version_for_modules))
+        .ok_or_else(|| String::from("无法推断 QR 版本"))?;
+    let matrix = sample_qr_grid(warped, version).map_err(|error| error.to_string())?;
+
+    result.qr_version = Some(version);
+    result.qr_reference_matrix = Some(matrix.clone());
+    result.matched_mask = None;
+    result.mask_choice = MaskChoice::GridFallback;
+    let svg = qr_matrix_to_svg_with_appearance(&matrix, 1.0, result.qr_appearance);
+    let (preview_name, preview, diff_count) = qr_preview_for_matrix(
+        &matrix,
+        result.qr_reference_matrix.as_ref(),
+        result.mask_choice,
+        result.qr_appearance,
+        show_diff_overlay,
+        job_id,
+    );
+    result.last_matrix = Some(matrix);
+    result.last_svg = Some(svg);
+    result.last_diff_count = Some(diff_count);
+    result.preview = Some((preview_name, preview));
+
+    Ok(version)
 }
 
 fn process_wx_image(
@@ -1112,11 +1203,302 @@ fn process_dy_image(
     }
 }
 
+fn infer_qr_appearance(
+    img: &DynamicImage,
+    finders: &[QrFinder; 3],
+    warped: &BinaryImage,
+) -> QrAppearance {
+    if has_wechat_center_badge(img, finders) {
+        QrAppearance::Wechat
+    } else if has_round_qr_finders(warped, finders) {
+        QrAppearance::Xiaohongshu
+    } else {
+        QrAppearance::Standard
+    }
+}
+
+fn has_wechat_center_badge(img: &DynamicImage, finders: &[QrFinder; 3]) -> bool {
+    let gray = img.to_luma8();
+    let (center, qr_side) = qr_center_and_side_from_finders(finders);
+    let core_side = (qr_side * 0.205).round().max(8.0) as i32;
+    let ring_inner_side = (qr_side * 0.230).round().max(f64::from(core_side + 2)) as i32;
+    let ring_outer_side = (qr_side * 0.275)
+        .round()
+        .max(f64::from(ring_inner_side + 2)) as i32;
+
+    let (core_dark, core_total, longest_run) =
+        centered_square_dark_stats(&gray, center, core_side, 112);
+    let (ring_light, ring_total) =
+        centered_square_ring_light_stats(&gray, center, ring_outer_side, ring_inner_side, 180);
+
+    if core_total == 0 || ring_total == 0 {
+        return false;
+    }
+
+    let core_dark_ratio = core_dark as f64 / core_total as f64;
+    let core_run_ratio = longest_run as f64 / core_side.max(1) as f64;
+    let ring_light_ratio = ring_light as f64 / ring_total as f64;
+    core_dark_ratio > 0.56 && core_run_ratio > 0.68 && ring_light_ratio > 0.68
+}
+
+fn qr_center_and_side_from_finders(finders: &[QrFinder; 3]) -> ((f64, f64), f64) {
+    let mut farthest = (finders[0], finders[1], 0.0_f64);
+    for i in 0..finders.len() {
+        for j in i + 1..finders.len() {
+            let dx = finders[i].cx - finders[j].cx;
+            let dy = finders[i].cy - finders[j].cy;
+            let distance_sq = dx * dx + dy * dy;
+            if distance_sq > farthest.2 {
+                farthest = (finders[i], finders[j], distance_sq);
+            }
+        }
+    }
+
+    let center = (
+        (farthest.0.cx + farthest.1.cx) * 0.5,
+        (farthest.0.cy + farthest.1.cy) * 0.5,
+    );
+    let module = ((finders[0].module + finders[1].module + finders[2].module) / 3.0).max(1.0);
+    let side = farthest.2.sqrt() / std::f64::consts::SQRT_2 + module * 7.0;
+    (center, side.max(module * 21.0))
+}
+
+fn centered_square_dark_stats(
+    gray: &GrayImage,
+    center: (f64, f64),
+    side: i32,
+    threshold: u8,
+) -> (u32, u32, i32) {
+    let width = gray.width() as i32;
+    let height = gray.height() as i32;
+    let x0 = (center.0 - f64::from(side) * 0.5).round() as i32;
+    let y0 = (center.1 - f64::from(side) * 0.5).round() as i32;
+    let mut dark = 0_u32;
+    let mut total = 0_u32;
+    let mut longest_run = 0_i32;
+
+    for y in y0..y0 + side {
+        let mut run = 0_i32;
+        for x in x0..x0 + side {
+            if x < 0 || y < 0 || x >= width || y >= height {
+                continue;
+            }
+            total += 1;
+            let is_dark = gray.get_pixel(x as u32, y as u32)[0] < threshold;
+            if is_dark {
+                dark += 1;
+                run += 1;
+                longest_run = longest_run.max(run);
+            } else {
+                run = 0;
+            }
+        }
+    }
+
+    (dark, total, longest_run)
+}
+
+fn centered_square_ring_light_stats(
+    gray: &GrayImage,
+    center: (f64, f64),
+    outer_side: i32,
+    inner_side: i32,
+    threshold: u8,
+) -> (u32, u32) {
+    let width = gray.width() as i32;
+    let height = gray.height() as i32;
+    let outer_x0 = (center.0 - f64::from(outer_side) * 0.5).round() as i32;
+    let outer_y0 = (center.1 - f64::from(outer_side) * 0.5).round() as i32;
+    let inner_x0 = (center.0 - f64::from(inner_side) * 0.5).round() as i32;
+    let inner_y0 = (center.1 - f64::from(inner_side) * 0.5).round() as i32;
+    let inner_x1 = inner_x0 + inner_side;
+    let inner_y1 = inner_y0 + inner_side;
+    let mut light = 0_u32;
+    let mut total = 0_u32;
+
+    for y in outer_y0..outer_y0 + outer_side {
+        for x in outer_x0..outer_x0 + outer_side {
+            if x >= inner_x0 && x < inner_x1 && y >= inner_y0 && y < inner_y1 {
+                continue;
+            }
+            if x < 0 || y < 0 || x >= width || y >= height {
+                continue;
+            }
+            total += 1;
+            if gray.get_pixel(x as u32, y as u32)[0] > threshold {
+                light += 1;
+            }
+        }
+    }
+
+    (light, total)
+}
+
+fn has_round_qr_finders(warped: &BinaryImage, finders: &[QrFinder; 3]) -> bool {
+    let modules = infer_qr_version(warped)
+        .ok()
+        .map(qr_modules_for_version)
+        .or_else(|| estimate_qr_modules_from_finders(finders));
+    modules.is_some_and(|modules| has_round_qr_finders_for_modules(warped, modules))
+}
+
+fn has_round_qr_finders_for_modules(warped: &BinaryImage, modules: usize) -> bool {
+    if modules < 21 || warped.w == 0 || warped.h == 0 {
+        return false;
+    }
+
+    let origins = [(0, 0), (modules - 7, 0), (0, modules - 7)];
+    let rounded_finders = origins
+        .into_iter()
+        .filter(|&(origin_x, origin_y)| round_qr_finder_score(warped, modules, origin_x, origin_y))
+        .count();
+
+    rounded_finders >= 2
+}
+
+fn round_qr_finder_score(
+    warped: &BinaryImage,
+    modules: usize,
+    origin_x: usize,
+    origin_y: usize,
+) -> bool {
+    let corners = [
+        (0.20, 0.20, 1.00, 1.00),
+        (6.00, 0.20, 6.80, 1.00),
+        (0.20, 6.00, 1.00, 6.80),
+        (6.00, 6.00, 6.80, 6.80),
+    ];
+    let sides = [
+        (2.45, 0.20, 4.55, 1.00),
+        (0.20, 2.45, 1.00, 4.55),
+        (6.00, 2.45, 6.80, 4.55),
+        (2.45, 6.00, 4.55, 6.80),
+    ];
+    let centers = [(2.50, 2.50, 4.50, 4.50)];
+
+    let corner_light_ratio =
+        average_regions_ratio(warped, modules, origin_x, origin_y, &corners, false);
+    let side_dark_ratio = average_regions_ratio(warped, modules, origin_x, origin_y, &sides, true);
+    let center_dark_ratio =
+        average_regions_ratio(warped, modules, origin_x, origin_y, &centers, true);
+
+    (corner_light_ratio >= 0.75 && side_dark_ratio >= 0.42 && center_dark_ratio >= 0.45)
+        || (corner_light_ratio >= 0.92 && center_dark_ratio >= 0.50)
+}
+
+fn estimate_qr_modules_from_finders(finders: &[QrFinder; 3]) -> Option<usize> {
+    let mut modules = [finders[0].module, finders[1].module, finders[2].module];
+    modules.sort_by(f64::total_cmp);
+    let avg_module = ((modules[0] + modules[1] + modules[2]) / 3.0).max(1.0);
+
+    let mut distances = [
+        finder_distance(&finders[0], &finders[1]),
+        finder_distance(&finders[0], &finders[2]),
+        finder_distance(&finders[1], &finders[2]),
+    ];
+    distances.sort_by(f64::total_cmp);
+
+    let raw_modules = ((distances[0] + distances[1]) * 0.5 / avg_module + 7.0).round();
+    if raw_modules < 21.0 {
+        return None;
+    }
+
+    let version = ((raw_modules - 21.0) / 4.0).round().clamp(0.0, 39.0) as usize;
+    Some(21 + version * 4)
+}
+
+fn finder_distance(a: &QrFinder, b: &QrFinder) -> f64 {
+    (a.cx - b.cx).hypot(a.cy - b.cy)
+}
+
+fn average_regions_ratio(
+    warped: &BinaryImage,
+    modules: usize,
+    origin_x: usize,
+    origin_y: usize,
+    regions: &[(f64, f64, f64, f64)],
+    count_black: bool,
+) -> f64 {
+    if regions.is_empty() {
+        return 0.0;
+    }
+
+    let total = regions
+        .iter()
+        .map(|&(x0, y0, x1, y1)| {
+            module_region_ratio(
+                warped,
+                modules,
+                origin_x as f64 + x0,
+                origin_y as f64 + y0,
+                origin_x as f64 + x1,
+                origin_y as f64 + y1,
+                count_black,
+            )
+        })
+        .sum::<f64>();
+    total / regions.len() as f64
+}
+
+fn module_region_ratio(
+    warped: &BinaryImage,
+    modules: usize,
+    module_x0: f64,
+    module_y0: f64,
+    module_x1: f64,
+    module_y1: f64,
+    count_black: bool,
+) -> f64 {
+    const SAMPLES_PER_AXIS: usize = 5;
+
+    if modules == 0 || warped.w == 0 || warped.h == 0 {
+        return 0.0;
+    }
+
+    let cell_w = warped.w as f64 / modules as f64;
+    let cell_h = warped.h as f64 / modules as f64;
+    let mut matching = 0_u32;
+    let mut total = 0_u32;
+
+    for sample_y in 0..SAMPLES_PER_AXIS {
+        let ty = (sample_y as f64 + 0.5) / SAMPLES_PER_AXIS as f64;
+        let module_y = module_y0 + (module_y1 - module_y0) * ty;
+        for sample_x in 0..SAMPLES_PER_AXIS {
+            let tx = (sample_x as f64 + 0.5) / SAMPLES_PER_AXIS as f64;
+            let module_x = module_x0 + (module_x1 - module_x0) * tx;
+            let x = (module_x * cell_w)
+                .round()
+                .clamp(0.0, warped.w.saturating_sub(1) as f64) as i32;
+            let y = (module_y * cell_h)
+                .round()
+                .clamp(0.0, warped.h.saturating_sub(1) as f64) as i32;
+            if warped.is_black(x, y) == count_black {
+                matching += 1;
+            }
+            total += 1;
+        }
+    }
+
+    matching as f64 / total.max(1) as f64
+}
+
+fn qr_modules_for_version(version: u8) -> usize {
+    (version as usize - 1) * 4 + 21
+}
+
+fn qr_version_for_modules(modules: usize) -> Option<u8> {
+    if !(21..=177).contains(&modules) || !(modules - 21).is_multiple_of(4) {
+        return None;
+    }
+    Some(((modules - 21) / 4 + 1) as u8)
+}
+
 struct QrMaskCandidate {
+    ecc: QrEcc,
     mask: u8,
     matrix: QrMatrix,
     total_diff: u32,
-    outside_logo_diff: u32,
+    outside_ignored_diff: u32,
 }
 
 fn choose_matching_qr_mask(
@@ -1125,20 +1507,22 @@ fn choose_matching_qr_mask(
 ) -> Option<QrMaskCandidate> {
     let preferred = decoded.original_mask;
     let mut candidates = qr_mask_candidates(decoded, reference_matrix);
-    let index = best_matching_qr_mask_index(&candidates, preferred)?;
+    let index = best_matching_qr_mask_index(&candidates, decoded.ecc, preferred)?;
     Some(candidates.swap_remove(index))
 }
 
 fn best_matching_qr_mask_index(
     candidates: &[QrMaskCandidate],
+    preferred_ecc: QrEcc,
     preferred: Option<u8>,
 ) -> Option<usize> {
     candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| candidate.outside_logo_diff == 0)
+        .filter(|(_, candidate)| candidate.outside_ignored_diff == 0)
         .min_by_key(|(_, candidate)| {
             (
+                candidate.ecc != preferred_ecc,
                 preferred != Some(candidate.mask),
                 candidate.total_diff,
                 candidate.mask,
@@ -1148,27 +1532,58 @@ fn best_matching_qr_mask_index(
 }
 
 fn qr_mask_candidates(decoded: &QrDecoded, reference_matrix: &QrMatrix) -> Vec<QrMaskCandidate> {
-    (0..=7)
-        .filter_map(|mask| {
-            let matrix = regenerate_qr(decoded, mask).ok()?;
-            let diff = compute_matrix_diff(reference_matrix, &matrix)?;
+    let mut candidates = Vec::new();
+    let mut seen_ecc = Vec::new();
+    for ecc in [decoded.ecc, QrEcc::L, QrEcc::M, QrEcc::Q, QrEcc::H] {
+        if seen_ecc.contains(&ecc) {
+            continue;
+        }
+        seen_ecc.push(ecc);
+
+        let mut decoded = decoded.clone();
+        decoded.ecc = ecc;
+        for mask in 0..=7 {
+            let Ok(matrix) = regenerate_qr(&decoded, mask) else {
+                continue;
+            };
+            let Some(diff) = compute_matrix_diff(reference_matrix, &matrix) else {
+                continue;
+            };
             let modules = matrix.len();
-            Some(QrMaskCandidate {
+            candidates.push(QrMaskCandidate {
+                ecc,
                 mask,
                 matrix,
                 total_diff: diff.diff_count,
-                outside_logo_diff: qr_diff_outside_center_logo(&diff, modules),
-            })
-        })
-        .collect()
+                outside_ignored_diff: qr_diff_outside_ignored_qr_regions(&diff, modules),
+            });
+        }
+    }
+    candidates
 }
 
-fn qr_diff_outside_center_logo(diff: &DiffResult, modules: usize) -> u32 {
+fn qr_diff_outside_ignored_qr_regions(diff: &DiffResult, modules: usize) -> u32 {
     let modules = modules.max(1);
     diff.diff_modules
         .iter()
-        .filter(|&&(x, y)| !is_qr_center_logo_module(modules, x as usize, y as usize))
+        .filter(|&&(x, y)| !is_ignored_qr_diff_module(modules, x as usize, y as usize))
         .count() as u32
+}
+
+fn is_ignored_qr_diff_module(modules: usize, x: usize, y: usize) -> bool {
+    is_qr_center_logo_module(modules, x, y) || is_qr_finder_or_separator_module(modules, x, y)
+}
+
+fn is_qr_finder_or_separator_module(modules: usize, x: usize, y: usize) -> bool {
+    if modules < 8 {
+        return false;
+    }
+    let near_left = x <= 7;
+    let near_top = y <= 7;
+    let near_right = x + 8 >= modules;
+    let near_bottom = y + 8 >= modules;
+
+    (near_left && near_top) || (near_right && near_top) || (near_left && near_bottom)
 }
 
 fn is_qr_center_logo_module(modules: usize, x: usize, y: usize) -> bool {
@@ -1207,6 +1622,7 @@ fn qr_preview_for_matrix(
     matrix: &QrMatrix,
     reference_matrix: Option<&QrMatrix>,
     mask_choice: MaskChoice,
+    appearance: QrAppearance,
     show_diff_overlay: bool,
     job_id: u64,
 ) -> (String, DynamicImage, u32) {
@@ -1214,10 +1630,17 @@ fn qr_preview_for_matrix(
     let diff_count = diff.as_ref().map(|diff| diff.diff_count).unwrap_or(0);
     let modules = matrix.len().max(1) as u32;
     let scale = (PREVIEW_SIZE / modules).max(2);
-    let preview = render_qr_diff_preview(matrix, diff.as_ref(), show_diff_overlay, scale, 0);
+    let preview = qr_matrix_to_preview_image(
+        matrix,
+        appearance,
+        diff.as_ref(),
+        show_diff_overlay,
+        scale,
+        0,
+    );
     let name = match mask_choice {
-        MaskChoice::Mask(mask) => format!("preview-mask-{mask}-{job_id}"),
-        MaskChoice::GridFallback => format!("preview-grid-fallback-{job_id}"),
+        MaskChoice::Mask(mask) => format!("preview-mask-{mask}-{appearance:?}-{job_id}"),
+        MaskChoice::GridFallback => format!("preview-grid-fallback-{appearance:?}-{job_id}"),
     };
     (name, preview, diff_count)
 }
@@ -1332,6 +1755,23 @@ fn platform_paste_shortcut_down(_ctx: &egui::Context) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn inferred_qr_appearance_for_sample(path: &str) -> Option<QrAppearance> {
+        let path = Path::new(path);
+        if !path.exists() {
+            return None;
+        }
+
+        let img = image::open(path).expect("sample image should load");
+        let binary = preprocess(&img);
+        let finders = find_qr_finders(&binary);
+        let selected =
+            select_qr_finder_triplet(&binary, &finders).expect("sample should have qr finders");
+        let corrected_source = warp_qr_to_square_image(&img, &binary, &selected, PREVIEW_SIZE);
+        let warped = preprocess(&corrected_source);
+        Some(infer_qr_appearance(&img, &selected, &warped))
+    }
 
     #[test]
     fn qr_mask_matching_ignores_center_logo_region() {
@@ -1342,7 +1782,19 @@ mod tests {
             diff_count: 3,
         };
 
-        assert_eq!(qr_diff_outside_center_logo(&diff, 29), 0);
+        assert_eq!(qr_diff_outside_ignored_qr_regions(&diff, 29), 0);
+    }
+
+    #[test]
+    fn qr_mask_matching_ignores_finder_style_regions() {
+        let diff = DiffResult {
+            diff_modules: vec![(0, 0), (28, 0), (0, 28), (7, 7)],
+            missing_in_generated: Vec::new(),
+            extra_in_generated: Vec::new(),
+            diff_count: 4,
+        };
+
+        assert_eq!(qr_diff_outside_ignored_qr_regions(&diff, 29), 0);
     }
 
     #[test]
@@ -1354,7 +1806,225 @@ mod tests {
             diff_count: 2,
         };
 
-        assert_eq!(qr_diff_outside_center_logo(&diff, 29), 1);
+        assert_eq!(qr_diff_outside_ignored_qr_regions(&diff, 29), 1);
+    }
+
+    #[test]
+    fn infers_standard_qr_appearance_from_standard_sample() {
+        let Some(appearance) = inferred_qr_appearance_for_sample("samples/标准样式.jpg") else {
+            return;
+        };
+
+        assert_eq!(appearance, QrAppearance::Standard);
+    }
+
+    #[test]
+    fn infers_standard_qr_appearance_from_photographed_standard_sample() {
+        let Some(appearance) = inferred_qr_appearance_for_sample("samples/标准样式拍照.jpg")
+        else {
+            return;
+        };
+
+        assert_eq!(appearance, QrAppearance::Standard);
+    }
+
+    #[test]
+    fn infers_wechat_qr_appearance_from_styled_sample() {
+        let Some(appearance) = inferred_qr_appearance_for_sample("samples/微信样式.png") else {
+            return;
+        };
+
+        assert_eq!(appearance, QrAppearance::Wechat);
+    }
+
+    #[test]
+    fn infers_xiaohongshu_qr_appearance_from_styled_sample() {
+        let Some(appearance) = inferred_qr_appearance_for_sample("samples/小红书样式.jpg")
+        else {
+            return;
+        };
+
+        assert_eq!(appearance, QrAppearance::Xiaohongshu);
+    }
+
+    #[test]
+    fn processes_xiaohongshu_qr_screenshot_samples_as_qr() {
+        for path in ["samples/小红书QR码1.jpg", "samples/小红书QR码2.jpg"] {
+            if !Path::new(path).exists() {
+                continue;
+            }
+
+            let img = image::open(path).expect("sample image should load");
+            let result = process_image(img, 0, false);
+
+            assert_eq!(result.code_kind, CodeKind::Qr, "{path}");
+            assert_eq!(result.qr_appearance, QrAppearance::Xiaohongshu, "{path}");
+            assert!(result.last_matrix.is_some(), "{path}: {}", result.status);
+            assert!(result.last_svg.is_some(), "{path}: {}", result.status);
+        }
+    }
+
+    #[test]
+    fn processes_xiaohongshu_qr1_zoom_variants_consistently() {
+        assert_xiaohongshu_zoom_variants_are_consistent(&[
+            "samples/小红书QR码1.jpg",
+            "samples/小红书QR码1放大.png",
+            "samples/小红书QR码1缩小.png",
+        ]);
+    }
+
+    #[test]
+    fn processes_xiaohongshu_qr2_zoom_variants_consistently() {
+        assert_xiaohongshu_zoom_variants_are_consistent(&[
+            "samples/小红书QR码2.jpg",
+            "samples/小红书QR码2放大a.png",
+            "samples/小红书QR码2放大b.png",
+            "samples/小红书QR码2放大c.png",
+            "samples/小红书QR码2缩小.png",
+        ]);
+    }
+
+    fn assert_xiaohongshu_zoom_variants_are_consistent(paths: &[&str]) {
+        let mut first_matrix: Option<QrMatrix> = None;
+        let mut first_svg: Option<String> = None;
+
+        for &path in paths {
+            if !Path::new(path).exists() {
+                continue;
+            }
+
+            let img = image::open(path).expect("sample image should load");
+            let result = process_image(img, 0, false);
+
+            assert_eq!(result.code_kind, CodeKind::Qr, "{path}");
+            assert_eq!(result.qr_appearance, QrAppearance::Xiaohongshu, "{path}");
+            assert_eq!(result.qr_version, Some(4), "{path}: {}", result.status);
+
+            let matrix = result
+                .last_matrix
+                .expect("xiaohongshu qr variant should produce a matrix");
+            assert_eq!(matrix.len(), 33, "{path}");
+
+            if let Some(reference) = first_matrix.as_ref() {
+                let diff = compute_matrix_diff(reference, &matrix).expect("same QR version");
+                assert_eq!(
+                    qr_diff_outside_ignored_qr_regions(&diff, matrix.len()),
+                    0,
+                    "{path}: data modules changed at {:?}",
+                    diff.diff_modules
+                );
+            } else {
+                first_matrix = Some(matrix);
+            }
+
+            let svg = result
+                .last_svg
+                .expect("xiaohongshu qr variant should produce svg");
+            if let Some(reference_svg) = first_svg.as_ref() {
+                assert_eq!(&svg, reference_svg, "{path}");
+            } else {
+                first_svg = Some(svg);
+            }
+        }
+    }
+
+    #[test]
+    fn decodeless_qr_grid_fallback_generates_svg_from_corrected_grid() {
+        let scale = 8_u32;
+        let warped = render_warped_qr_finders(true, 21, scale);
+        let finders = [
+            QrFinder {
+                cx: 3.5 * scale as f64,
+                cy: 3.5 * scale as f64,
+                module: scale as f64,
+            },
+            QrFinder {
+                cx: 17.5 * scale as f64,
+                cy: 3.5 * scale as f64,
+                module: scale as f64,
+            },
+            QrFinder {
+                cx: 3.5 * scale as f64,
+                cy: 17.5 * scale as f64,
+                module: scale as f64,
+            },
+        ];
+        let mut result = ProcessResult {
+            code_kind: CodeKind::Qr,
+            status: String::new(),
+            binary: None,
+            finders: None,
+            warped: Some(warped.clone()),
+            mask_choice: MaskChoice::Mask(0),
+            qr_appearance: QrAppearance::Xiaohongshu,
+            last_decoded: None,
+            qr_version: None,
+            last_matrix: None,
+            qr_reference_matrix: None,
+            matched_mask: None,
+            last_wx_grid: None,
+            last_dy_grid: None,
+            last_svg: None,
+            last_diff_count: None,
+            preview: None,
+        };
+
+        let version =
+            try_use_decodeless_qr_grid_fallback(&warped, &finders, &mut result, false, 0).unwrap();
+
+        assert_eq!(version, 1);
+        assert_eq!(result.mask_choice, MaskChoice::GridFallback);
+        assert_eq!(result.last_matrix.as_ref().map(Vec::len), Some(21));
+        assert!(
+            result
+                .last_svg
+                .as_ref()
+                .is_some_and(|svg| svg.contains("<svg"))
+        );
+        assert_eq!(result.last_diff_count, Some(0));
+        assert!(result.preview.is_some());
+    }
+
+    #[test]
+    fn round_qr_finder_heuristic_rejects_standard_finders() {
+        let warped = render_warped_qr_finders(false, 21, 8);
+
+        assert!(!has_round_qr_finders_for_modules(&warped, 21));
+    }
+
+    #[test]
+    fn round_qr_finder_heuristic_accepts_xiaohongshu_finders() {
+        let warped = render_warped_qr_finders(true, 21, 8);
+
+        assert!(has_round_qr_finders_for_modules(&warped, 21));
+    }
+
+    fn render_warped_qr_finders(round: bool, modules: usize, scale: u32) -> BinaryImage {
+        let size = modules as u32 * scale;
+        let mut data = vec![255; (size * size) as usize];
+        for (origin_x, origin_y) in [(0, 0), (modules - 7, 0), (0, modules - 7)] {
+            for py in origin_y as u32 * scale..(origin_y as u32 + 7) * scale {
+                for px in origin_x as u32 * scale..(origin_x as u32 + 7) * scale {
+                    let local_x = px as f64 / scale as f64 - origin_x as f64;
+                    let local_y = py as f64 / scale as f64 - origin_y as f64;
+                    let black = if round {
+                        let distance = (local_x - 3.5).hypot(local_y - 3.5);
+                        distance <= 3.5 && !(distance > 1.5 && distance <= 2.5)
+                    } else {
+                        let module_x = (local_x.floor() as usize).min(6);
+                        let module_y = (local_y.floor() as usize).min(6);
+                        let dx = (module_x as i32 - 3).abs();
+                        let dy = (module_y as i32 - 3).abs();
+                        dx.max(dy) != 2
+                    };
+                    if black {
+                        data[(py * size + px) as usize] = 0;
+                    }
+                }
+            }
+        }
+
+        BinaryImage::new(size, size, data)
     }
 }
 

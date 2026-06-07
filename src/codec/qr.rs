@@ -95,9 +95,8 @@ pub fn decode_qr(img: &DynamicImage, warped: Option<&BinaryImage>) -> Result<QrD
     }
 
     let image_metadata = warped.and_then(infer_qr_image_metadata);
-    let ecc = image_metadata
-        .and_then(|metadata| metadata.ecc)
-        .or_else(|| ecc_from_result_metadata(&result))
+    let ecc = ecc_from_result_metadata(&result)
+        .or_else(|| image_metadata.and_then(|metadata| metadata.ecc))
         .ok_or_else(|| QRacerError::QrDecode("missing QR error correction metadata".to_owned()))?;
     let version = image_metadata
         .map(|metadata| metadata.version)

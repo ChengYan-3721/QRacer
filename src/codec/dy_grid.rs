@@ -142,6 +142,30 @@ const BLACK_BORDER_CODE_RINGS: [(f64, f64); 5] = [
 ];
 const BLACK_BORDER_OUTER_FRAME_RING: (f64, f64) = (261.10, 283.47);
 const BLACK_BORDER_FINE_RINGS: [(f64, f64); 2] = [(246.00, 249.00), (204.10, 207.10)];
+const NO_BORDER_STANDARD_LOCATOR_DISTANCE: f64 = 240.529442688416;
+// Cell centers land at 1 deg + n * 3 deg in the standard no-border SVG.
+const NO_BORDER_STANDARD_CODE_THETA_OFFSET: f64 = -0.5_f64.to_radians();
+const NO_BORDER_STANDARD_SAMPLE_THETA_OFFSET: f64 = NO_BORDER_STANDARD_CODE_THETA_OFFSET;
+const NO_BORDER_STANDARD_RADIUS_SCALE: f64 = 1.005;
+const NO_BORDER_RADIAL_SPREAD_SCALE: f64 = 0.998;
+const NO_BORDER_DECORATIVE_RADIUS_SCORE_WEIGHT: f64 = 0.80;
+const NO_BORDER_FINDER_CODE_SKIP_SCALE: f64 = 0.80;
+const NO_BORDER_CENTER_SEARCH_RADIUS: i32 = 2;
+const NO_BORDER_BLACK_THRESHOLD: f64 = 6.0 / 9.0;
+const NO_BORDER_DECORATIVE_BLACK_THRESHOLD: f64 = 5.0 / 9.0;
+const NO_BORDER_SAMPLE_THETA_OFFSETS: [f64; 3] = [-0.15, 0.0, 0.15];
+const NO_BORDER_SAMPLE_RADIAL_OFFSETS: [f64; 3] = [-0.20, 0.0, 0.20];
+const NO_BORDER_RADIUS_SCORE_THRESHOLD: f64 = 0.26;
+const NO_BORDER_RADIUS_SCORE_THETA_OFFSETS: [f64; 3] = [-0.15, 0.0, 0.15];
+const NO_BORDER_RADIUS_SCORE_RADIAL_OFFSETS: [f64; 3] = [-0.20, 0.0, 0.20];
+const NO_BORDER_RINGS: [(f64, f64, bool); 6] = [
+    (229.78129202897986, 4.0, true),
+    (209.6213360594897, 5.0, false),
+    (190.12287822447763, 4.0, true),
+    (171.44589181206953, 5.0, false),
+    (152.35786834266318, 5.0, false),
+    (133.26960322367916, 5.0, false),
+];
 
 #[derive(Debug, Clone, Copy)]
 struct ReservedAreas<'a> {
@@ -153,12 +177,13 @@ struct ReservedAreas<'a> {
 }
 
 impl DyGrid {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn code_ring_count(&self) -> u8 {
-        self.rings.len() as u8
+        self.rings.iter().filter(|ring| !ring.is_decoration).count() as u8
     }
 
     pub fn ring_count(&self) -> u8 {
-        self.code_ring_count() + self.decorative_rings.len() as u8
+        self.rings.len() as u8 + self.decorative_rings.len() as u8
     }
 
     pub fn sample(&self, ring: u32, point: u32) -> bool {
@@ -219,7 +244,7 @@ fn sample_dy_impl(
         )));
     }
 
-    let geometry = dy_geometry(finders)?;
+    let mut geometry = dy_geometry(finders)?;
     let detected_badge = source.and_then(|source| detect_dy_badge(source, &geometry));
     let badge = if params.has_border {
         black_border_badge_from_finders_and_detection(finders, detected_badge)
@@ -242,18 +267,37 @@ fn sample_dy_impl(
                 radius: geometry.r_min * 0.72,
             })
         });
+    let no_border_theta_offset =
+        (!params.has_border).then(|| no_border_standard_code_theta_offset(finders));
+    if !params.has_border {
+        let theta_offset = no_border_theta_offset.unwrap_or(NO_BORDER_STANDARD_SAMPLE_THETA_OFFSET);
+        geometry = best_no_border_geometry(
+            bin,
+            &geometry,
+            finders,
+            params.points_per_ring,
+            theta_offset,
+        );
+    }
     let candidate_ring_count = if params.has_border {
         BLACK_BORDER_CODE_RINGS.len() as u8
     } else {
         params.ring_count
     };
-    let candidate_rings = ring_specs(
-        &geometry,
-        DyParams {
-            ring_count: candidate_ring_count,
-            ..params
-        },
-    );
+    let candidate_rings = if params.has_border {
+        ring_specs(
+            &geometry,
+            DyParams {
+                ring_count: candidate_ring_count,
+                ..params
+            },
+        )
+    } else {
+        let theta_offset = no_border_theta_offset.unwrap_or(NO_BORDER_STANDARD_SAMPLE_THETA_OFFSET);
+        let radius_scale =
+            best_no_border_radius_scale(bin, &geometry, params.points_per_ring, theta_offset);
+        no_border_ring_specs_with_radius_scale(&geometry, radius_scale)
+    };
     let theta_offset = if params.has_border {
         let alignment_rings = black_border_alignment_rings(&candidate_rings);
         black_border_standard_code_theta_offset(finders, params.points_per_ring, badge_style)
@@ -266,7 +310,7 @@ fn sample_dy_impl(
                 )
             })
     } else {
-        best_theta_offset(bin, &geometry, &candidate_rings, params.points_per_ring)
+        no_border_theta_offset.unwrap_or(NO_BORDER_STANDARD_SAMPLE_THETA_OFFSET)
     };
     let provisional_reserved_areas = ReservedAreas {
         finders,
@@ -307,7 +351,11 @@ fn sample_dy_impl(
         .has_border
         .then(|| source.map(|source| source.to_luma8()))
         .flatten();
-    let black_threshold = if params.has_border { 0.34 } else { 0.26 };
+    let black_threshold = if params.has_border {
+        0.34
+    } else {
+        NO_BORDER_BLACK_THRESHOLD
+    };
     let mut samples = Vec::with_capacity(rings.len() * params.points_per_ring as usize);
     let mut ratios = Vec::with_capacity(rings.len() * params.points_per_ring as usize);
 
@@ -323,15 +371,31 @@ fn sample_dy_impl(
                 &geometry,
                 &reserved_areas,
             );
-            let ratio = sample_cell_black_ratio(
-                bin,
-                &geometry,
-                ring,
-                params.points_per_ring,
-                theta_offset,
-                point,
-            );
-            let black = !reserved && ratio >= black_threshold;
+            let ratio = if params.has_border {
+                sample_cell_black_ratio(
+                    bin,
+                    &geometry,
+                    ring,
+                    params.points_per_ring,
+                    theta_offset,
+                    point,
+                )
+            } else {
+                sample_no_border_cell_black_ratio(
+                    bin,
+                    &geometry,
+                    ring,
+                    params.points_per_ring,
+                    theta_offset,
+                    point,
+                )
+            };
+            let threshold = if !params.has_border && ring.is_decoration {
+                NO_BORDER_DECORATIVE_BLACK_THRESHOLD
+            } else {
+                black_threshold
+            };
+            let black = !reserved && ratio >= threshold;
             ratios.push(ratio);
             samples.push(black);
         }
@@ -452,6 +516,10 @@ fn ring_specs(geometry: &DyGeometry, params: DyParams) -> Vec<RingSpec> {
 }
 
 fn regular_ring_specs(geometry: &DyGeometry, ring_count: u8) -> Vec<RingSpec> {
+    if ring_count == NO_BORDER_RINGS.len() as u8 {
+        return no_border_ring_specs(geometry);
+    }
+
     let thickness = (geometry.r_max - geometry.r_min) / ring_count as f64;
     (0..ring_count)
         .map(|ring| RingSpec {
@@ -460,6 +528,176 @@ fn regular_ring_specs(geometry: &DyGeometry, ring_count: u8) -> Vec<RingSpec> {
             is_decoration: ring == 0 || ring == 2,
         })
         .collect()
+}
+
+fn no_border_ring_specs(geometry: &DyGeometry) -> Vec<RingSpec> {
+    no_border_ring_specs_with_radius_scale(geometry, NO_BORDER_STANDARD_RADIUS_SCALE)
+}
+
+fn no_border_ring_specs_with_radius_scale(
+    geometry: &DyGeometry,
+    radius_scale: f64,
+) -> Vec<RingSpec> {
+    let scale = (geometry.locator_distance / NO_BORDER_STANDARD_LOCATOR_DISTANCE).max(0.01);
+    NO_BORDER_RINGS
+        .iter()
+        .map(|&(radius, half_width, is_decoration)| {
+            let radius = no_border_adjusted_standard_radius(radius);
+            RingSpec {
+                r_inner: (radius * radius_scale - half_width) * scale,
+                r_outer: (radius * radius_scale + half_width) * scale,
+                is_decoration,
+            }
+        })
+        .collect()
+}
+
+fn no_border_adjusted_standard_radius(radius: f64) -> f64 {
+    let midpoint = (NO_BORDER_RINGS[0].0 + NO_BORDER_RINGS[NO_BORDER_RINGS.len() - 1].0) * 0.5;
+    midpoint + (radius - midpoint) * NO_BORDER_RADIAL_SPREAD_SCALE
+}
+
+fn best_no_border_radius_scale(
+    bin: &BinaryImage,
+    geometry: &DyGeometry,
+    points_per_ring: u32,
+    theta_offset: f64,
+) -> f64 {
+    let base_scale = (geometry.locator_distance / NO_BORDER_STANDARD_LOCATOR_DISTANCE).max(0.01);
+    let mut best = (NO_BORDER_STANDARD_RADIUS_SCALE, f64::INFINITY);
+
+    for radius_step in 396..=414 {
+        let radius_scale = radius_step as f64 / 400.0;
+        let code_rings = NO_BORDER_RINGS
+            .iter()
+            .filter(|(_, _, is_decoration)| !*is_decoration)
+            .map(|&(radius, half_width, is_decoration)| {
+                let radius = no_border_adjusted_standard_radius(radius);
+                RingSpec {
+                    r_inner: (radius * radius_scale - half_width) * base_scale,
+                    r_outer: (radius * radius_scale + half_width) * base_scale,
+                    is_decoration,
+                }
+            })
+            .collect::<Vec<_>>();
+        let decorative_rings = NO_BORDER_RINGS
+            .iter()
+            .filter(|(_, _, is_decoration)| *is_decoration)
+            .map(|&(radius, half_width, is_decoration)| {
+                let radius = no_border_adjusted_standard_radius(radius);
+                RingSpec {
+                    r_inner: (radius * radius_scale - half_width) * base_scale,
+                    r_outer: (radius * radius_scale + half_width) * base_scale,
+                    is_decoration,
+                }
+            })
+            .collect::<Vec<_>>();
+        let score = candidate_no_border_grid_score(
+            bin,
+            geometry,
+            &code_rings,
+            points_per_ring,
+            theta_offset,
+        ) + candidate_no_border_grid_score(
+            bin,
+            geometry,
+            &decorative_rings,
+            points_per_ring,
+            theta_offset,
+        ) * NO_BORDER_DECORATIVE_RADIUS_SCORE_WEIGHT;
+        if score < best.1 {
+            best = (radius_scale, score);
+        }
+    }
+
+    best.0
+}
+
+fn best_no_border_geometry(
+    bin: &BinaryImage,
+    base_geometry: &DyGeometry,
+    finders: &[DyFinder; 3],
+    points_per_ring: u32,
+    theta_offset: f64,
+) -> DyGeometry {
+    let mut best = (*base_geometry, f64::INFINITY, f64::INFINITY);
+
+    for dx in -NO_BORDER_CENTER_SEARCH_RADIUS..=NO_BORDER_CENTER_SEARCH_RADIUS {
+        for dy in -NO_BORDER_CENTER_SEARCH_RADIUS..=NO_BORDER_CENTER_SEARCH_RADIUS {
+            let dx = f64::from(dx);
+            let dy = f64::from(dy);
+            let geometry = no_border_geometry_with_center_offset(base_geometry, finders, dx, dy);
+            let radius_scale =
+                best_no_border_radius_scale(bin, &geometry, points_per_ring, theta_offset);
+            let rings = no_border_ring_specs_with_radius_scale(&geometry, radius_scale);
+            let score =
+                no_border_geometry_score(bin, &geometry, &rings, points_per_ring, theta_offset);
+            let offset2 = dx * dx + dy * dy;
+            if score < best.1 - f64::EPSILON
+                || ((score - best.1).abs() <= f64::EPSILON && offset2 < best.2)
+            {
+                best = (geometry, score, offset2);
+            }
+        }
+    }
+
+    best.0
+}
+
+fn no_border_geometry_with_center_offset(
+    geometry: &DyGeometry,
+    finders: &[DyFinder; 3],
+    dx: f64,
+    dy: f64,
+) -> DyGeometry {
+    let center = (geometry.center.0 + dx, geometry.center.1 + dy);
+    let locator_radius = finders.iter().map(DyFinder::outer_radius).sum::<f64>() / 3.0;
+    let locator_distance = finders
+        .iter()
+        .map(|finder| distance(center, (finder.cx, finder.cy)))
+        .sum::<f64>()
+        / finders.len() as f64;
+    let r_max = finders
+        .iter()
+        .map(|finder| distance(center, (finder.cx, finder.cy)) + finder.outer_radius() * 1.10)
+        .fold(0.0, f64::max)
+        .max(locator_radius * 5.0);
+    let r_min = (r_max * 0.36).max(locator_radius * 2.0);
+
+    DyGeometry {
+        center,
+        locator_distance,
+        r_min,
+        r_max,
+    }
+}
+
+fn no_border_geometry_score(
+    bin: &BinaryImage,
+    geometry: &DyGeometry,
+    rings: &[RingSpec],
+    points_per_ring: u32,
+    theta_offset: f64,
+) -> f64 {
+    let code_rings = rings
+        .iter()
+        .copied()
+        .filter(|ring| !ring.is_decoration)
+        .collect::<Vec<_>>();
+    let decorative_rings = rings
+        .iter()
+        .copied()
+        .filter(|ring| ring.is_decoration)
+        .collect::<Vec<_>>();
+
+    candidate_no_border_grid_score(bin, geometry, &code_rings, points_per_ring, theta_offset)
+        + candidate_no_border_grid_score(
+            bin,
+            geometry,
+            &decorative_rings,
+            points_per_ring,
+            theta_offset,
+        ) * NO_BORDER_DECORATIVE_RADIUS_SCORE_WEIGHT
 }
 
 fn black_border_ring_specs(geometry: &DyGeometry, ring_count: u8) -> Vec<RingSpec> {
@@ -1624,6 +1862,16 @@ fn black_border_standard_code_theta_offset(
     Some(normalize_angle(standard_offset + rotation))
 }
 
+fn no_border_standard_code_theta_offset(finders: &[DyFinder; 3]) -> f64 {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let br = &ordered[2];
+    let diagonal_angle = (br.cy - tl.cy).atan2(br.cx - tl.cx);
+    let rotation = diagonal_angle - std::f64::consts::FRAC_PI_4;
+
+    normalize_angle(NO_BORDER_STANDARD_SAMPLE_THETA_OFFSET + rotation)
+}
+
 fn candidate_grid_score(
     bin: &BinaryImage,
     geometry: &DyGeometry,
@@ -1631,15 +1879,63 @@ fn candidate_grid_score(
     points_per_ring: u32,
     theta_offset: f64,
 ) -> f64 {
+    candidate_grid_score_with_offsets(
+        bin,
+        geometry,
+        rings,
+        points_per_ring,
+        theta_offset,
+        (&[-0.20, 0.0, 0.20], &[-0.25, 0.0, 0.25]),
+        0.26,
+    )
+}
+
+fn candidate_no_border_grid_score(
+    bin: &BinaryImage,
+    geometry: &DyGeometry,
+    rings: &[RingSpec],
+    points_per_ring: u32,
+    theta_offset: f64,
+) -> f64 {
+    candidate_grid_score_with_offsets(
+        bin,
+        geometry,
+        rings,
+        points_per_ring,
+        theta_offset,
+        (
+            &NO_BORDER_RADIUS_SCORE_THETA_OFFSETS,
+            &NO_BORDER_RADIUS_SCORE_RADIAL_OFFSETS,
+        ),
+        NO_BORDER_RADIUS_SCORE_THRESHOLD,
+    )
+}
+
+fn candidate_grid_score_with_offsets(
+    bin: &BinaryImage,
+    geometry: &DyGeometry,
+    rings: &[RingSpec],
+    points_per_ring: u32,
+    theta_offset: f64,
+    offsets: (&[f64], &[f64]),
+    threshold: f64,
+) -> f64 {
     let mut uncertainty = 0.0;
     let mut black = 0_u32;
     let mut total = 0_u32;
     for ring in rings {
         for point in 0..points_per_ring {
-            let ratio =
-                sample_cell_black_ratio(bin, geometry, ring, points_per_ring, theta_offset, point);
+            let ratio = sample_cell_black_ratio_with_offsets(
+                bin,
+                geometry,
+                ring,
+                points_per_ring,
+                theta_offset,
+                point,
+                offsets,
+            );
             uncertainty += ratio.min(1.0 - ratio);
-            if ratio >= 0.26 {
+            if ratio >= threshold {
                 black += 1;
             }
             total += 1;
@@ -1675,6 +1971,28 @@ fn sample_cell_black_ratio(
         theta_offset,
         point,
         (&[-0.20, 0.0, 0.20], &[-0.25, 0.0, 0.25]),
+    )
+}
+
+fn sample_no_border_cell_black_ratio(
+    bin: &BinaryImage,
+    geometry: &DyGeometry,
+    ring: &RingSpec,
+    points_per_ring: u32,
+    theta_offset: f64,
+    point: u32,
+) -> f64 {
+    sample_cell_black_ratio_with_offsets(
+        bin,
+        geometry,
+        ring,
+        points_per_ring,
+        theta_offset,
+        point,
+        (
+            &NO_BORDER_SAMPLE_THETA_OFFSETS,
+            &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+        ),
     )
 }
 
@@ -1857,7 +2175,8 @@ fn is_reserved_cell(
     );
     (!reserved.has_border
         && reserved.finders.iter().any(|finder| {
-            distance(point_xy, (finder.cx, finder.cy)) <= finder.outer_radius() * 1.30
+            distance(point_xy, (finder.cx, finder.cy))
+                <= finder.outer_radius() * NO_BORDER_FINDER_CODE_SKIP_SCALE
         }))
         || reserved.badge.is_some_and(|badge| {
             is_badge_code_cell(
@@ -2503,6 +2822,1712 @@ mod tests {
             processed += 1;
         }
         assert!(processed > 0, "no Douyin samples found");
+    }
+
+    #[test]
+    fn no_border_finder_adjacent_code_cells_are_not_over_reserved() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+
+        let path = std::path::Path::new("samples/无框版1.jpg");
+        let marker_path = std::path::Path::new("samples/无框版1.svg");
+        if !path.exists() || !marker_path.exists() {
+            return;
+        }
+
+        let img = image::open(path).unwrap();
+        let raw_binary = preprocess(&img);
+        let raw_finders = find_dy_finders(&raw_binary);
+        let raw_selected = select_dy_finders_raw(&raw_finders)
+            .unwrap_or_else(|| panic!("failed to select dy finders for {}", path.display()));
+        let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+        let top_right =
+            detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+        let corrected_source = warp_dy_to_upright_image_with_top_right(
+            &img,
+            &raw_selected,
+            top_right,
+            correction_size,
+        );
+        let corrected_binary = preprocess(&corrected_source);
+        let selected = dy_upright_target_finders(&raw_selected, correction_size);
+        let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+        let grid =
+            sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params).unwrap();
+        let marker_svg = std::fs::read_to_string(marker_path).unwrap();
+        let expected = no_border_expected_code_points(&marker_svg, grid.points_per_ring);
+
+        assert!(!grid.has_border);
+        assert_eq!(grid.points_per_ring, 120);
+        for (ring, point) in [(1, 12), (1, 13), (1, 43), (1, 71), (1, 72), (1, 73)] {
+            assert!(
+                expected[ring][point as usize],
+                "fixture point should be black before checking sampling: ring={ring}, point={point}"
+            );
+            assert!(
+                grid.sample(ring as u32, point),
+                "no-border finder-adjacent code cell was over-reserved: ring={ring}, point={point}"
+            );
+        }
+    }
+
+    fn no_border_expected_code_points(svg: &str, points_per_ring: u32) -> Vec<Vec<bool>> {
+        let mut expected = vec![vec![false; points_per_ring as usize]; NO_BORDER_RINGS.len()];
+        let center = (304.32, 307.63);
+        let theta_step = std::f64::consts::TAU / points_per_ring as f64;
+        for tag in svg
+            .split('<')
+            .filter(|tag| tag.starts_with("circle ") && tag.contains("fill:red"))
+        {
+            let Some(cx) = svg_attr_f64_debug(tag, "cx") else {
+                continue;
+            };
+            let Some(cy) = svg_attr_f64_debug(tag, "cy") else {
+                continue;
+            };
+            let radius = distance((cx, cy), center);
+            let Some((ring_idx, _)) = NO_BORDER_RINGS
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, decorative))| !*decorative)
+                .map(|(idx, (standard_radius, _, _))| (idx, (radius - standard_radius).abs()))
+                .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
+            else {
+                continue;
+            };
+            let theta = (cy - center.1).atan2(cx - center.0);
+            let point = ((theta - NO_BORDER_STANDARD_CODE_THETA_OFFSET) / theta_step - 0.5)
+                .round()
+                .rem_euclid(points_per_ring as f64) as usize;
+            expected[ring_idx][point] = true;
+        }
+        expected
+    }
+
+    fn svg_attr_f64_debug(tag: &str, attr: &str) -> Option<f64> {
+        let needle = format!("{attr}=\"");
+        let start = tag.find(&needle)? + needle.len();
+        let end = tag[start..].find('"')? + start;
+        tag[start..end].parse().ok()
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_diff_grid_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        for path in douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("无框版"))
+            })
+        {
+            let img = image::open(&path).unwrap();
+            let raw_binary = preprocess(&img);
+            let raw_finders = find_dy_finders(&raw_binary);
+            let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                panic!("failed to select raw dy finders for {}", path.display())
+            });
+            let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+            let top_right =
+                detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+            let corrected_source = warp_dy_to_upright_image_with_top_right(
+                &img,
+                &raw_selected,
+                top_right,
+                correction_size,
+            );
+            let corrected_binary = preprocess(&corrected_source);
+            let selected = dy_upright_target_finders(&raw_selected, correction_size);
+            let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+            let base_grid =
+                sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                    .unwrap();
+            let geometry = dy_geometry(&selected).unwrap();
+            let base_scale = geometry.locator_distance / NO_BORDER_STANDARD_LOCATOR_DISTANCE;
+            let reserved = ReservedAreas {
+                finders: &selected,
+                badge: base_grid.badge,
+                badge_style: base_grid.badge_style,
+                logo: base_grid.center_logo,
+                has_border: false,
+            };
+            let mut best = Vec::new();
+
+            for radius_step in 396..=414 {
+                let radius_scale = radius_step as f64 / 400.0;
+                let rings = NO_BORDER_RINGS
+                    .iter()
+                    .map(|&(radius, half_width, is_decoration)| RingSpec {
+                        r_inner: (radius * radius_scale - half_width) * base_scale,
+                        r_outer: (radius * radius_scale + half_width) * base_scale,
+                        is_decoration,
+                    })
+                    .collect::<Vec<_>>();
+                for phase_step in -8..=4 {
+                    let theta_offset = phase_step as f64 * 0.125_f64.to_radians();
+                    let mut samples = Vec::with_capacity(rings.len() * 120);
+                    for (ring_idx, ring) in rings.iter().enumerate() {
+                        for point in 0..120 {
+                            let reserved_cell = is_reserved_cell(
+                                ring,
+                                ring_idx as u32,
+                                point,
+                                120,
+                                theta_offset,
+                                &geometry,
+                                &reserved,
+                            );
+                            let ratio = sample_cell_black_ratio(
+                                &corrected_binary,
+                                &geometry,
+                                ring,
+                                120,
+                                theta_offset,
+                                point,
+                            );
+                            samples.push(!reserved_cell && ratio >= 0.26);
+                        }
+                    }
+                    let mut candidate = base_grid.clone();
+                    candidate.rings = rings.clone();
+                    candidate.theta_offset = theta_offset;
+                    candidate.samples = samples;
+                    let (_, diff_count) =
+                        dy_grid_to_diff_preview_image(&candidate, &corrected_binary, false, 512);
+                    best.push((diff_count, radius_scale, phase_step as f64 * 0.125));
+                }
+            }
+
+            best.sort_by_key(|&(diff_count, _, _)| diff_count);
+            println!("{}", path.file_name().unwrap().to_string_lossy());
+            for (diff_count, radius_scale, phase_deg) in best.into_iter().take(10) {
+                println!("  diff={diff_count} radius_scale={radius_scale:.4} phase={phase_deg:.3}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_fixture_sampling_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+
+        let path = std::path::Path::new("samples/无框版1.jpg");
+        let marker_path = std::path::Path::new("samples/无框版1.svg");
+        if !path.exists() || !marker_path.exists() {
+            return;
+        }
+
+        let img = image::open(path).unwrap();
+        let raw_binary = preprocess(&img);
+        let raw_finders = find_dy_finders(&raw_binary);
+        let raw_selected = select_dy_finders_raw(&raw_finders)
+            .unwrap_or_else(|| panic!("failed to select raw dy finders for {}", path.display()));
+        let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+        let top_right =
+            detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+        let corrected_source = warp_dy_to_upright_image_with_top_right(
+            &img,
+            &raw_selected,
+            top_right,
+            correction_size,
+        );
+        let corrected_binary = preprocess(&corrected_source);
+        let selected = dy_upright_target_finders(&raw_selected, correction_size);
+        let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+        let base_grid =
+            sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params).unwrap();
+        let geometry = dy_geometry(&selected).unwrap();
+        let base_scale = geometry.locator_distance / NO_BORDER_STANDARD_LOCATOR_DISTANCE;
+        let expected =
+            no_border_expected_code_points(&std::fs::read_to_string(marker_path).unwrap(), 120);
+        let reserved = ReservedAreas {
+            finders: &selected,
+            badge: base_grid.badge,
+            badge_style: base_grid.badge_style,
+            logo: base_grid.center_logo,
+            has_border: false,
+        };
+        let mut best = Vec::new();
+
+        for radius_step in 396..=414 {
+            let radius_scale = radius_step as f64 / 400.0;
+            let rings = NO_BORDER_RINGS
+                .iter()
+                .map(|&(radius, half_width, is_decoration)| RingSpec {
+                    r_inner: (radius * radius_scale - half_width) * base_scale,
+                    r_outer: (radius * radius_scale + half_width) * base_scale,
+                    is_decoration,
+                })
+                .collect::<Vec<_>>();
+            for phase_step in -8..=2 {
+                let theta_offset = phase_step as f64 * 0.125_f64.to_radians();
+                for threshold_step in 16..=38 {
+                    let threshold = threshold_step as f64 / 100.0;
+                    let mut fp = 0_u32;
+                    let mut fn_ = 0_u32;
+                    let mut tp = 0_u32;
+                    let mut tn = 0_u32;
+
+                    for (ring_idx, ring) in rings.iter().enumerate() {
+                        if ring.is_decoration {
+                            continue;
+                        }
+                        for point in 0..120 {
+                            let expected_black = expected[ring_idx][point as usize];
+                            let reserved_cell = is_reserved_cell(
+                                ring,
+                                ring_idx as u32,
+                                point,
+                                120,
+                                theta_offset,
+                                &geometry,
+                                &reserved,
+                            );
+                            let ratio = sample_cell_black_ratio(
+                                &corrected_binary,
+                                &geometry,
+                                ring,
+                                120,
+                                theta_offset,
+                                point,
+                            );
+                            let sampled_black = !reserved_cell && ratio >= threshold;
+                            match (expected_black, sampled_black) {
+                                (true, true) => tp += 1,
+                                (true, false) => fn_ += 1,
+                                (false, true) => fp += 1,
+                                (false, false) => tn += 1,
+                            }
+                        }
+                    }
+
+                    best.push((
+                        fp + fn_,
+                        fp,
+                        fn_,
+                        tp,
+                        tn,
+                        radius_scale,
+                        phase_step,
+                        threshold,
+                    ));
+                }
+            }
+        }
+
+        best.sort_by_key(|&(errors, fp, fn_, _, _, _, _, _)| (errors, fp + fn_, fp));
+        for (errors, fp, fn_, tp, tn, radius_scale, phase_step, threshold) in
+            best.into_iter().take(20)
+        {
+            println!(
+                "errors={errors} fp={fp} fn={fn_} tp={tp} tn={tn} radius={radius_scale:.4} phase={:.3} threshold={threshold:.2}",
+                phase_step as f64 * 0.125
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_sampling_footprint_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        let fixtures = douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("无框版"))
+            })
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select raw dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let base_grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let geometry = dy_geometry(&selected).unwrap();
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    base_grid,
+                    geometry,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let footprint_sets: [(&[f64], &[f64]); 6] = [
+            (&[-0.20, 0.0, 0.20], &[-0.25, 0.0, 0.25]),
+            (&[-0.15, 0.0, 0.15], &[-0.20, 0.0, 0.20]),
+            (&[-0.25, 0.0, 0.25], &[-0.25, 0.0, 0.25]),
+            (&[-0.20, 0.0, 0.20], &[-0.35, 0.0, 0.35]),
+            (&[-0.30, 0.0, 0.30], &[-0.20, 0.0, 0.20]),
+            (&[-0.10, 0.0, 0.10], &[-0.30, 0.0, 0.30]),
+        ];
+        let thresholds = [3.0 / 9.0, 4.0 / 9.0, 5.0 / 9.0, 6.0 / 9.0];
+        let mut totals = Vec::new();
+
+        for (footprint_idx, offsets) in footprint_sets.into_iter().enumerate() {
+            for threshold in thresholds {
+                let mut total = 0_u32;
+                let mut max_diff = 0_u32;
+                let mut per_sample = Vec::new();
+
+                for (_, corrected_binary, base_grid, geometry) in &fixtures {
+                    let mut candidate = base_grid.clone();
+                    let reserved = ReservedAreas {
+                        finders: &base_grid.finders,
+                        badge: base_grid.badge,
+                        badge_style: base_grid.badge_style,
+                        logo: base_grid.center_logo,
+                        has_border: false,
+                    };
+                    candidate.samples = sample_no_border_with_offsets(
+                        corrected_binary,
+                        geometry,
+                        &candidate.rings,
+                        candidate.points_per_ring,
+                        candidate.theta_offset,
+                        &reserved,
+                        offsets,
+                        threshold,
+                    );
+                    let (_, diff_count) =
+                        dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+                    total += diff_count;
+                    max_diff = max_diff.max(diff_count);
+                    per_sample.push(diff_count);
+                }
+
+                totals.push((total, max_diff, footprint_idx, threshold, per_sample));
+            }
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (total, max_diff));
+        for (total, max_diff, footprint_idx, threshold, per_sample) in totals.into_iter().take(16) {
+            println!(
+                "footprint={footprint_idx} threshold={threshold:.3} total={total} max={max_diff} per_sample={per_sample:?}"
+            );
+        }
+    }
+
+    fn sample_no_border_with_offsets(
+        bin: &BinaryImage,
+        geometry: &DyGeometry,
+        rings: &[RingSpec],
+        points_per_ring: u32,
+        theta_offset: f64,
+        reserved: &ReservedAreas<'_>,
+        offsets: (&[f64], &[f64]),
+        threshold: f64,
+    ) -> Vec<bool> {
+        let mut samples = Vec::with_capacity(rings.len() * points_per_ring as usize);
+        for (ring_idx, ring) in rings.iter().enumerate() {
+            for point in 0..points_per_ring {
+                let reserved_cell = is_reserved_cell(
+                    ring,
+                    ring_idx as u32,
+                    point,
+                    points_per_ring,
+                    theta_offset,
+                    geometry,
+                    reserved,
+                );
+                let ratio = sample_cell_black_ratio_with_offsets(
+                    bin,
+                    geometry,
+                    ring,
+                    points_per_ring,
+                    theta_offset,
+                    point,
+                    offsets,
+                );
+                samples.push(!reserved_cell && ratio >= threshold);
+            }
+        }
+        samples
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_run_cleanup_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        let fixtures = douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter_map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select raw dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                if params.has_border {
+                    return None;
+                }
+                let base_grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let geometry = dy_geometry(&selected).unwrap();
+                let reserved = ReservedAreas {
+                    finders: &base_grid.finders,
+                    badge: base_grid.badge,
+                    badge_style: base_grid.badge_style,
+                    logo: base_grid.center_logo,
+                    has_border: false,
+                };
+                let ratios = no_border_sample_ratios(
+                    &corrected_binary,
+                    &geometry,
+                    &base_grid.rings,
+                    base_grid.points_per_ring,
+                    base_grid.theta_offset,
+                );
+                let reserved_mask = no_border_reserved_mask(
+                    &geometry,
+                    &base_grid.rings,
+                    base_grid.points_per_ring,
+                    base_grid.theta_offset,
+                    &reserved,
+                );
+                Some((
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    base_grid,
+                    ratios,
+                    reserved_mask,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let mut configs = vec![NoBorderRunCleanupConfig::default()];
+        for remove_len in [1, 2] {
+            for remove_ratio in [6.0 / 9.0, 7.0 / 9.0, 8.0 / 9.0, 1.0] {
+                configs.push(NoBorderRunCleanupConfig {
+                    remove_black_max_len: remove_len,
+                    remove_black_max_ratio: remove_ratio,
+                    ..Default::default()
+                });
+            }
+        }
+        for close_len in [1, 2] {
+            for close_ratio in [4.0 / 9.0, 5.0 / 9.0, 6.0 / 9.0] {
+                configs.push(NoBorderRunCleanupConfig {
+                    close_white_max_len: close_len,
+                    close_white_min_ratio: close_ratio,
+                    ..Default::default()
+                });
+            }
+        }
+        for shrink_ratio in [6.0 / 9.0, 7.0 / 9.0, 8.0 / 9.0] {
+            configs.push(NoBorderRunCleanupConfig {
+                shrink_endpoint_max_ratio: shrink_ratio,
+                ..Default::default()
+            });
+        }
+        for extend_ratio in [4.0 / 9.0, 5.0 / 9.0, 6.0 / 9.0] {
+            configs.push(NoBorderRunCleanupConfig {
+                extend_endpoint_min_ratio: extend_ratio,
+                ..Default::default()
+            });
+        }
+        for shrink_ratio in [6.0 / 9.0, 7.0 / 9.0] {
+            for extend_ratio in [5.0 / 9.0, 6.0 / 9.0] {
+                configs.push(NoBorderRunCleanupConfig {
+                    shrink_endpoint_max_ratio: shrink_ratio,
+                    extend_endpoint_min_ratio: extend_ratio,
+                    ..Default::default()
+                });
+            }
+        }
+        for remove_len in [1, 2] {
+            for close_ratio in [5.0 / 9.0, 6.0 / 9.0] {
+                configs.push(NoBorderRunCleanupConfig {
+                    remove_black_max_len: remove_len,
+                    remove_black_max_ratio: 7.0 / 9.0,
+                    close_white_max_len: 1,
+                    close_white_min_ratio: close_ratio,
+                    ..Default::default()
+                });
+            }
+        }
+
+        let mut totals = Vec::new();
+        for config in configs {
+            let mut total = 0_u32;
+            let mut max_diff = 0_u32;
+            let mut per_sample = Vec::new();
+
+            for (_, corrected_binary, base_grid, ratios, reserved_mask) in &fixtures {
+                let mut candidate = base_grid.clone();
+                apply_no_border_run_cleanup(
+                    &mut candidate.samples,
+                    ratios,
+                    reserved_mask,
+                    &candidate.rings,
+                    candidate.points_per_ring,
+                    config,
+                );
+                let (_, diff_count) =
+                    dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+                total += diff_count;
+                max_diff = max_diff.max(diff_count);
+                per_sample.push(diff_count);
+            }
+
+            totals.push((total, max_diff, config, per_sample));
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _)| (total, max_diff));
+        println!("best by total");
+        for (total, max_diff, config, per_sample) in totals.iter().take(16) {
+            println!(
+                "{} total={total} max={max_diff} per_sample={per_sample:?}",
+                config.label()
+            );
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _)| (max_diff, total));
+        println!("best by max");
+        for (total, max_diff, config, per_sample) in totals.into_iter().take(16) {
+            println!(
+                "{} total={total} max={max_diff} per_sample={per_sample:?}",
+                config.label()
+            );
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NoBorderRunCleanupConfig {
+        remove_black_max_len: u32,
+        remove_black_max_ratio: f64,
+        close_white_max_len: u32,
+        close_white_min_ratio: f64,
+        shrink_endpoint_max_ratio: f64,
+        extend_endpoint_min_ratio: f64,
+    }
+
+    impl NoBorderRunCleanupConfig {
+        fn label(self) -> String {
+            format!(
+                "remove<={}@{:.3} close<={}@{:.3} shrink@{:.3} extend@{:.3}",
+                self.remove_black_max_len,
+                self.remove_black_max_ratio,
+                self.close_white_max_len,
+                self.close_white_min_ratio,
+                self.shrink_endpoint_max_ratio,
+                self.extend_endpoint_min_ratio
+            )
+        }
+    }
+
+    fn no_border_sample_ratios(
+        bin: &BinaryImage,
+        geometry: &DyGeometry,
+        rings: &[RingSpec],
+        points_per_ring: u32,
+        theta_offset: f64,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(rings.len() * points_per_ring as usize);
+        for ring in rings {
+            for point in 0..points_per_ring {
+                ratios.push(sample_cell_black_ratio_with_offsets(
+                    bin,
+                    geometry,
+                    ring,
+                    points_per_ring,
+                    theta_offset,
+                    point,
+                    (
+                        &NO_BORDER_SAMPLE_THETA_OFFSETS,
+                        &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+                    ),
+                ));
+            }
+        }
+        ratios
+    }
+
+    fn no_border_reserved_mask(
+        geometry: &DyGeometry,
+        rings: &[RingSpec],
+        points_per_ring: u32,
+        theta_offset: f64,
+        reserved: &ReservedAreas<'_>,
+    ) -> Vec<bool> {
+        let mut mask = Vec::with_capacity(rings.len() * points_per_ring as usize);
+        for (ring_idx, ring) in rings.iter().enumerate() {
+            for point in 0..points_per_ring {
+                mask.push(is_reserved_cell(
+                    ring,
+                    ring_idx as u32,
+                    point,
+                    points_per_ring,
+                    theta_offset,
+                    geometry,
+                    reserved,
+                ));
+            }
+        }
+        mask
+    }
+
+    fn apply_no_border_run_cleanup(
+        samples: &mut [bool],
+        ratios: &[f64],
+        reserved: &[bool],
+        rings: &[RingSpec],
+        points_per_ring: u32,
+        config: NoBorderRunCleanupConfig,
+    ) {
+        let points = points_per_ring as usize;
+        if points == 0 {
+            return;
+        }
+
+        for (ring_idx, ring) in rings.iter().enumerate() {
+            let start = ring_idx * points;
+            let end = start + points;
+            if end > samples.len() || end > ratios.len() || end > reserved.len() {
+                return;
+            }
+
+            let mut current = samples[start..end].to_vec();
+
+            if config.remove_black_max_len > 0 {
+                let original = current.clone();
+                for run in circular_runs(&original, true) {
+                    if run.len > config.remove_black_max_len {
+                        continue;
+                    }
+                    let max_ratio = circular_run_max_ratio(&ratios[start..end], run);
+                    if max_ratio <= config.remove_black_max_ratio + f64::EPSILON {
+                        set_circular_run(&mut current, run.start, run.len, false);
+                    }
+                }
+            }
+
+            if config.shrink_endpoint_max_ratio > 0.0 {
+                let original = current.clone();
+                for run in circular_runs(&original, true) {
+                    if run.len <= 1 {
+                        continue;
+                    }
+                    let first = (run.start % points_per_ring) as usize;
+                    let last = ((run.start + run.len - 1) % points_per_ring) as usize;
+                    if ratios[start + first] <= config.shrink_endpoint_max_ratio + f64::EPSILON {
+                        current[first] = false;
+                    }
+                    if ratios[start + last] <= config.shrink_endpoint_max_ratio + f64::EPSILON {
+                        current[last] = false;
+                    }
+                }
+            }
+
+            if config.close_white_max_len > 0 {
+                let original = current.clone();
+                for run in circular_runs(&original, false) {
+                    if run.len > config.close_white_max_len
+                        || !has_neighboring_black(&original, run.start, run.len)
+                    {
+                        continue;
+                    }
+                    let min_ratio = circular_run_min_ratio(&ratios[start..end], run);
+                    if min_ratio >= config.close_white_min_ratio - f64::EPSILON
+                        && circular_run_all_unreserved(&reserved[start..end], run)
+                    {
+                        set_circular_run(&mut current, run.start, run.len, true);
+                    }
+                }
+            }
+
+            if config.extend_endpoint_min_ratio > 0.0 {
+                let original = current.clone();
+                for run in circular_runs(&original, true) {
+                    if run.len >= points_per_ring {
+                        continue;
+                    }
+                    for point in [
+                        (run.start + points_per_ring - 1) % points_per_ring,
+                        (run.start + run.len) % points_per_ring,
+                    ] {
+                        let idx = point as usize;
+                        if !reserved[start + idx]
+                            && !original[idx]
+                            && ratios[start + idx]
+                                >= config.extend_endpoint_min_ratio - f64::EPSILON
+                        {
+                            current[idx] = true;
+                        }
+                    }
+                }
+            }
+
+            if ring.is_decoration {
+                samples[start..end].copy_from_slice(&current);
+            } else {
+                samples[start..end].copy_from_slice(&current);
+            }
+        }
+    }
+
+    fn circular_run_max_ratio(ratios: &[f64], run: CircularRun) -> f64 {
+        circular_run_ratios(ratios, run).fold(0.0, f64::max)
+    }
+
+    fn circular_run_min_ratio(ratios: &[f64], run: CircularRun) -> f64 {
+        circular_run_ratios(ratios, run).fold(f64::INFINITY, f64::min)
+    }
+
+    fn circular_run_all_unreserved(reserved: &[bool], run: CircularRun) -> bool {
+        let points = reserved.len() as u32;
+        points > 0
+            && (0..run.len).all(|offset| {
+                let point = (run.start + offset) % points;
+                !reserved[point as usize]
+            })
+    }
+
+    fn circular_run_ratios(ratios: &[f64], run: CircularRun) -> impl Iterator<Item = f64> + '_ {
+        let points = ratios.len() as u32;
+        (0..run.len).filter_map(move |offset| {
+            (points > 0).then(|| {
+                let point = (run.start + offset) % points;
+                ratios[point as usize]
+            })
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_center_score_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        let fixtures = douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter_map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select raw dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                if params.has_border {
+                    return None;
+                }
+                let base_grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let base_geometry = dy_geometry(&selected).unwrap();
+                Some((
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    base_grid,
+                    base_geometry,
+                    selected,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let mut score_total = 0_u32;
+        let mut score_max = 0_u32;
+        let mut score_per_sample = Vec::new();
+        let mut diff_total = 0_u32;
+        let mut diff_max = 0_u32;
+        let mut diff_per_sample = Vec::new();
+        let mut base_total = 0_u32;
+        let mut base_max = 0_u32;
+        let mut base_per_sample = Vec::new();
+
+        for (stem, corrected_binary, base_grid, base_geometry, selected) in &fixtures {
+            let (_, base_diff) =
+                dy_grid_to_diff_preview_image(base_grid, corrected_binary, false, 384);
+            base_total += base_diff;
+            base_max = base_max.max(base_diff);
+            base_per_sample.push(base_diff);
+
+            let mut best_score: Option<(f64, u32, f64, f64, f64)> = None;
+            let mut best_diff: Option<(u32, f64, f64, f64, f64)> = None;
+
+            for dx_step in -2..=2 {
+                for dy_step in -2..=2 {
+                    let dx = f64::from(dx_step);
+                    let dy = f64::from(dy_step);
+                    let geometry =
+                        no_border_geometry_with_center_offset(base_geometry, selected, dx, dy);
+                    let radius_scale = best_no_border_radius_scale(
+                        corrected_binary,
+                        &geometry,
+                        base_grid.points_per_ring,
+                        base_grid.theta_offset,
+                    );
+                    let rings = no_border_ring_specs_with_radius_scale(&geometry, radius_scale);
+                    let reserved = ReservedAreas {
+                        finders: &base_grid.finders,
+                        badge: base_grid.badge,
+                        badge_style: base_grid.badge_style,
+                        logo: base_grid.center_logo,
+                        has_border: false,
+                    };
+                    let mut candidate = base_grid.clone();
+                    candidate.center = geometry.center;
+                    candidate.rings = rings;
+                    candidate.samples = sample_no_border_with_ring_thresholds(
+                        corrected_binary,
+                        &geometry,
+                        &candidate.rings,
+                        candidate.points_per_ring,
+                        candidate.theta_offset,
+                        &reserved,
+                        (
+                            &NO_BORDER_SAMPLE_THETA_OFFSETS,
+                            &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+                        ),
+                        NO_BORDER_BLACK_THRESHOLD,
+                        NO_BORDER_DECORATIVE_BLACK_THRESHOLD,
+                    );
+                    let score = debug_no_border_geometry_score(
+                        corrected_binary,
+                        &geometry,
+                        &candidate.rings,
+                        candidate.points_per_ring,
+                        candidate.theta_offset,
+                    );
+                    let (_, diff_count) =
+                        dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+
+                    if best_score.is_none_or(|(best, best_diff_count, _, _, _)| {
+                        score < best || (score == best && diff_count < best_diff_count)
+                    }) {
+                        best_score = Some((score, diff_count, dx, dy, radius_scale));
+                    }
+                    if best_diff.is_none_or(|(best, _, _, _, _)| diff_count < best) {
+                        best_diff = Some((diff_count, score, dx, dy, radius_scale));
+                    }
+                }
+            }
+
+            let (score, score_diff, score_dx, score_dy, score_radius) = best_score.unwrap();
+            let (diff_count, diff_score, diff_dx, diff_dy, diff_radius) = best_diff.unwrap();
+            score_total += score_diff;
+            score_max = score_max.max(score_diff);
+            score_per_sample.push(score_diff);
+            diff_total += diff_count;
+            diff_max = diff_max.max(diff_count);
+            diff_per_sample.push(diff_count);
+
+            println!(
+                "{stem} base={base_diff} best_score diff={score_diff} score={score:.4} dx={score_dx:.1} dy={score_dy:.1} radius={score_radius:.4} best_diff diff={diff_count} score={diff_score:.4} dx={diff_dx:.1} dy={diff_dy:.1} radius={diff_radius:.4}"
+            );
+        }
+
+        println!("base total={base_total} max={base_max} per_sample={base_per_sample:?}");
+        println!(
+            "score_selected total={score_total} max={score_max} per_sample={score_per_sample:?}"
+        );
+        println!("diff_oracle total={diff_total} max={diff_max} per_sample={diff_per_sample:?}");
+    }
+
+    fn no_border_geometry_with_center_offset(
+        geometry: &DyGeometry,
+        finders: &[DyFinder; 3],
+        dx: f64,
+        dy: f64,
+    ) -> DyGeometry {
+        let center = (geometry.center.0 + dx, geometry.center.1 + dy);
+        let locator_radius = finders.iter().map(DyFinder::outer_radius).sum::<f64>() / 3.0;
+        let locator_distance = finders
+            .iter()
+            .map(|finder| distance(center, (finder.cx, finder.cy)))
+            .sum::<f64>()
+            / finders.len() as f64;
+        let r_max = finders
+            .iter()
+            .map(|finder| distance(center, (finder.cx, finder.cy)) + finder.outer_radius() * 1.10)
+            .fold(0.0, f64::max)
+            .max(locator_radius * 5.0);
+        let r_min = (r_max * 0.36).max(locator_radius * 2.0);
+
+        DyGeometry {
+            center,
+            locator_distance,
+            r_min,
+            r_max,
+        }
+    }
+
+    fn debug_no_border_geometry_score(
+        bin: &BinaryImage,
+        geometry: &DyGeometry,
+        rings: &[RingSpec],
+        points_per_ring: u32,
+        theta_offset: f64,
+    ) -> f64 {
+        let code_rings = rings
+            .iter()
+            .copied()
+            .filter(|ring| !ring.is_decoration)
+            .collect::<Vec<_>>();
+        let decorative_rings = rings
+            .iter()
+            .copied()
+            .filter(|ring| ring.is_decoration)
+            .collect::<Vec<_>>();
+
+        candidate_no_border_grid_score(bin, geometry, &code_rings, points_per_ring, theta_offset)
+            + candidate_no_border_grid_score(
+                bin,
+                geometry,
+                &decorative_rings,
+                points_per_ring,
+                theta_offset,
+            ) * NO_BORDER_DECORATIVE_RADIUS_SCORE_WEIGHT
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_radius_score_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        let fixtures = douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("无框版"))
+            })
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select raw dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let base_grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let geometry = dy_geometry(&selected).unwrap();
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    base_grid,
+                    geometry,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let score_footprints: [(&str, (&[f64], &[f64])); 4] = [
+            ("old", (&[-0.20, 0.0, 0.20], &[-0.25, 0.0, 0.25])),
+            (
+                "new",
+                (
+                    &NO_BORDER_SAMPLE_THETA_OFFSETS,
+                    &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+                ),
+            ),
+            ("narrow", (&[-0.10, 0.0, 0.10], &[-0.20, 0.0, 0.20])),
+            ("wide_r", (&[-0.15, 0.0, 0.15], &[-0.30, 0.0, 0.30])),
+        ];
+        let thresholds = [0.26, 4.0 / 9.0, 5.0 / 9.0, 6.0 / 9.0];
+        let decorative_weights = [0.0, 0.15, 0.35, 0.55, 0.80];
+        let mut totals = Vec::new();
+
+        for (footprint_name, score_offsets) in score_footprints {
+            for score_threshold in thresholds {
+                for decorative_weight in decorative_weights {
+                    let mut total = 0_u32;
+                    let mut max_diff = 0_u32;
+                    let mut per_sample = Vec::new();
+                    let mut radius_scales = Vec::new();
+
+                    for (_, corrected_binary, base_grid, geometry) in &fixtures {
+                        let radius_scale = debug_best_no_border_radius_scale(
+                            corrected_binary,
+                            geometry,
+                            base_grid.points_per_ring,
+                            base_grid.theta_offset,
+                            score_offsets,
+                            score_threshold,
+                            decorative_weight,
+                        );
+                        let rings =
+                            debug_no_border_ring_specs_with_radius_scale(geometry, radius_scale);
+                        let reserved = ReservedAreas {
+                            finders: &base_grid.finders,
+                            badge: base_grid.badge,
+                            badge_style: base_grid.badge_style,
+                            logo: base_grid.center_logo,
+                            has_border: false,
+                        };
+                        let mut candidate = base_grid.clone();
+                        candidate.rings = rings;
+                        candidate.samples = sample_no_border_with_offsets(
+                            corrected_binary,
+                            geometry,
+                            &candidate.rings,
+                            candidate.points_per_ring,
+                            candidate.theta_offset,
+                            &reserved,
+                            (
+                                &NO_BORDER_SAMPLE_THETA_OFFSETS,
+                                &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+                            ),
+                            NO_BORDER_BLACK_THRESHOLD,
+                        );
+                        let (_, diff_count) =
+                            dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+                        total += diff_count;
+                        max_diff = max_diff.max(diff_count);
+                        per_sample.push(diff_count);
+                        radius_scales.push(radius_scale);
+                    }
+
+                    totals.push((
+                        total,
+                        max_diff,
+                        footprint_name,
+                        score_threshold,
+                        decorative_weight,
+                        per_sample,
+                        radius_scales,
+                    ));
+                }
+            }
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _, _, _)| (total, max_diff));
+        println!("best by total");
+        for (total, max_diff, footprint_name, threshold, decorative_weight, per_sample, radii) in
+            totals.iter().take(12)
+        {
+            println!(
+                "footprint={footprint_name} threshold={threshold:.3} decor_weight={decorative_weight:.2} total={total} max={max_diff} per_sample={per_sample:?} radii={radii:?}"
+            );
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _, _, _)| (max_diff, total));
+        println!("best by max");
+        for (total, max_diff, footprint_name, threshold, decorative_weight, per_sample, radii) in
+            totals.into_iter().take(12)
+        {
+            println!(
+                "footprint={footprint_name} threshold={threshold:.3} decor_weight={decorative_weight:.2} total={total} max={max_diff} per_sample={per_sample:?} radii={radii:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_ring_threshold_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        let fixtures = douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("无框版"))
+            })
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select raw dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let base_grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let geometry = dy_geometry(&selected).unwrap();
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    base_grid,
+                    geometry,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let thresholds = [4.0 / 9.0, 5.0 / 9.0, 6.0 / 9.0, 7.0 / 9.0];
+        let mut totals = Vec::new();
+
+        for code_threshold in thresholds {
+            for decorative_threshold in thresholds {
+                let mut total = 0_u32;
+                let mut max_diff = 0_u32;
+                let mut per_sample = Vec::new();
+
+                for (_, corrected_binary, base_grid, geometry) in &fixtures {
+                    let reserved = ReservedAreas {
+                        finders: &base_grid.finders,
+                        badge: base_grid.badge,
+                        badge_style: base_grid.badge_style,
+                        logo: base_grid.center_logo,
+                        has_border: false,
+                    };
+                    let mut candidate = base_grid.clone();
+                    candidate.samples = sample_no_border_with_ring_thresholds(
+                        corrected_binary,
+                        geometry,
+                        &candidate.rings,
+                        candidate.points_per_ring,
+                        candidate.theta_offset,
+                        &reserved,
+                        (
+                            &NO_BORDER_SAMPLE_THETA_OFFSETS,
+                            &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+                        ),
+                        code_threshold,
+                        decorative_threshold,
+                    );
+                    let (_, diff_count) =
+                        dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+                    total += diff_count;
+                    max_diff = max_diff.max(diff_count);
+                    per_sample.push(diff_count);
+                }
+
+                totals.push((
+                    total,
+                    max_diff,
+                    code_threshold,
+                    decorative_threshold,
+                    per_sample,
+                ));
+            }
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (total, max_diff));
+        for (total, max_diff, code_threshold, decorative_threshold, per_sample) in
+            totals.into_iter().take(16)
+        {
+            println!(
+                "code_threshold={code_threshold:.3} decorative_threshold={decorative_threshold:.3} total={total} max={max_diff} per_sample={per_sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_production_spread_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        let fixtures = douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("无框版"))
+            })
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select raw dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let base_grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let geometry = dy_geometry(&selected).unwrap();
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    base_grid,
+                    geometry,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let spreads = [0.990, 0.994, 0.996, 0.998, 1.000, 1.002];
+        let mut totals = Vec::new();
+
+        for spread in spreads {
+            let mut total = 0_u32;
+            let mut max_diff = 0_u32;
+            let mut per_sample = Vec::new();
+            let mut radii = Vec::new();
+
+            for (_, corrected_binary, base_grid, geometry) in &fixtures {
+                let radius_scale = debug_best_no_border_radius_scale_with_spread(
+                    corrected_binary,
+                    geometry,
+                    base_grid.points_per_ring,
+                    base_grid.theta_offset,
+                    spread,
+                );
+                let rings = debug_no_border_ring_specs_with_radius_scale_and_spread(
+                    geometry,
+                    radius_scale,
+                    spread,
+                );
+                let reserved = ReservedAreas {
+                    finders: &base_grid.finders,
+                    badge: base_grid.badge,
+                    badge_style: base_grid.badge_style,
+                    logo: base_grid.center_logo,
+                    has_border: false,
+                };
+                let mut candidate = base_grid.clone();
+                candidate.rings = rings;
+                candidate.samples = sample_no_border_with_offsets(
+                    corrected_binary,
+                    geometry,
+                    &candidate.rings,
+                    candidate.points_per_ring,
+                    candidate.theta_offset,
+                    &reserved,
+                    (
+                        &NO_BORDER_SAMPLE_THETA_OFFSETS,
+                        &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+                    ),
+                    NO_BORDER_BLACK_THRESHOLD,
+                );
+                let (_, diff_count) =
+                    dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+                total += diff_count;
+                max_diff = max_diff.max(diff_count);
+                per_sample.push(diff_count);
+                radii.push(radius_scale);
+            }
+
+            totals.push((total, max_diff, spread, per_sample, radii));
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (total, max_diff));
+        for (total, max_diff, spread, per_sample, radii) in totals {
+            println!(
+                "spread={spread:.3} total={total} max={max_diff} per_sample={per_sample:?} radii={radii:?}"
+            );
+        }
+    }
+
+    fn debug_best_no_border_radius_scale_with_spread(
+        bin: &BinaryImage,
+        geometry: &DyGeometry,
+        points_per_ring: u32,
+        theta_offset: f64,
+        spread: f64,
+    ) -> f64 {
+        let mut best = (NO_BORDER_STANDARD_RADIUS_SCALE, f64::INFINITY);
+        for radius_step in 396..=414 {
+            let radius_scale = radius_step as f64 / 400.0;
+            let rings = debug_no_border_ring_specs_with_radius_scale_and_spread(
+                geometry,
+                radius_scale,
+                spread,
+            );
+            let code_rings = rings
+                .iter()
+                .copied()
+                .filter(|ring| !ring.is_decoration)
+                .collect::<Vec<_>>();
+            let decorative_rings = rings
+                .iter()
+                .copied()
+                .filter(|ring| ring.is_decoration)
+                .collect::<Vec<_>>();
+            let score = candidate_no_border_grid_score(
+                bin,
+                geometry,
+                &code_rings,
+                points_per_ring,
+                theta_offset,
+            ) + candidate_no_border_grid_score(
+                bin,
+                geometry,
+                &decorative_rings,
+                points_per_ring,
+                theta_offset,
+            ) * NO_BORDER_DECORATIVE_RADIUS_SCORE_WEIGHT;
+            if score < best.1 {
+                best = (radius_scale, score);
+            }
+        }
+        best.0
+    }
+
+    fn debug_no_border_ring_specs_with_radius_scale_and_spread(
+        geometry: &DyGeometry,
+        radius_scale: f64,
+        spread: f64,
+    ) -> Vec<RingSpec> {
+        let scale = (geometry.locator_distance / NO_BORDER_STANDARD_LOCATOR_DISTANCE).max(0.01);
+        NO_BORDER_RINGS
+            .iter()
+            .map(|&(radius, half_width, is_decoration)| {
+                let radius = debug_no_border_adjusted_standard_radius(radius, spread);
+                RingSpec {
+                    r_inner: (radius * radius_scale - half_width) * scale,
+                    r_outer: (radius * radius_scale + half_width) * scale,
+                    is_decoration,
+                }
+            })
+            .collect()
+    }
+
+    fn debug_no_border_adjusted_standard_radius(radius: f64, spread: f64) -> f64 {
+        let midpoint = (NO_BORDER_RINGS[0].0 + NO_BORDER_RINGS[NO_BORDER_RINGS.len() - 1].0) * 0.5;
+        midpoint + (radius - midpoint) * spread
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_no_border_phase_search() {
+        use crate::detect::finder_dy::select_dy_finders_raw;
+        use crate::pipeline::perspective::{
+            detect_dy_badge_anchor, dy_upright_target_finders,
+            warp_dy_to_upright_image_with_top_right,
+        };
+        use crate::vector::svg::dy_grid_to_diff_preview_image;
+
+        let fixtures = douyin_sample_paths()
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("无框版"))
+            })
+            .map(|path| {
+                let img = image::open(&path).unwrap();
+                let raw_binary = preprocess(&img);
+                let raw_finders = find_dy_finders(&raw_binary);
+                let raw_selected = select_dy_finders_raw(&raw_finders).unwrap_or_else(|| {
+                    panic!("failed to select raw dy finders for {}", path.display())
+                });
+                let correction_size = img.width().max(img.height()).clamp(1024, 1600);
+                let top_right =
+                    detect_dy_badge_anchor(&img, &raw_selected).map(|badge| (badge.cx, badge.cy));
+                let corrected_source = warp_dy_to_upright_image_with_top_right(
+                    &img,
+                    &raw_selected,
+                    top_right,
+                    correction_size,
+                );
+                let corrected_binary = preprocess(&corrected_source);
+                let selected = dy_upright_target_finders(&raw_selected, correction_size);
+                let params = detect_dy_params(&corrected_binary, &selected).unwrap();
+                let base_grid =
+                    sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+                        .unwrap();
+                let geometry = dy_geometry(&selected).unwrap();
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    corrected_binary,
+                    base_grid,
+                    geometry,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut totals = Vec::new();
+        for phase_step in -8..=8 {
+            let phase_delta = f64::from(phase_step) * 0.125_f64.to_radians();
+            let mut total = 0_u32;
+            let mut max_diff = 0_u32;
+            let mut per_sample = Vec::new();
+            let mut radii = Vec::new();
+
+            for (_, corrected_binary, base_grid, geometry) in &fixtures {
+                let theta_offset = normalize_angle(base_grid.theta_offset + phase_delta);
+                let radius_scale = debug_best_no_border_radius_scale_with_spread(
+                    corrected_binary,
+                    geometry,
+                    base_grid.points_per_ring,
+                    theta_offset,
+                    NO_BORDER_RADIAL_SPREAD_SCALE,
+                );
+                let rings = debug_no_border_ring_specs_with_radius_scale_and_spread(
+                    geometry,
+                    radius_scale,
+                    NO_BORDER_RADIAL_SPREAD_SCALE,
+                );
+                let reserved = ReservedAreas {
+                    finders: &base_grid.finders,
+                    badge: base_grid.badge,
+                    badge_style: base_grid.badge_style,
+                    logo: base_grid.center_logo,
+                    has_border: false,
+                };
+                let mut candidate = base_grid.clone();
+                candidate.theta_offset = theta_offset;
+                candidate.rings = rings;
+                candidate.samples = sample_no_border_with_offsets(
+                    corrected_binary,
+                    geometry,
+                    &candidate.rings,
+                    candidate.points_per_ring,
+                    candidate.theta_offset,
+                    &reserved,
+                    (
+                        &NO_BORDER_SAMPLE_THETA_OFFSETS,
+                        &NO_BORDER_SAMPLE_RADIAL_OFFSETS,
+                    ),
+                    NO_BORDER_BLACK_THRESHOLD,
+                );
+                let (_, diff_count) =
+                    dy_grid_to_diff_preview_image(&candidate, corrected_binary, false, 384);
+                total += diff_count;
+                max_diff = max_diff.max(diff_count);
+                per_sample.push(diff_count);
+                radii.push(radius_scale);
+            }
+
+            totals.push((total, max_diff, phase_step, per_sample, radii));
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (total, max_diff));
+        println!("best by total");
+        for (total, max_diff, phase_step, per_sample, radii) in totals.iter().take(10) {
+            let phase_deg = f64::from(*phase_step) * 0.125;
+            println!(
+                "phase={phase_deg:.3} total={total} max={max_diff} per_sample={per_sample:?} radii={radii:?}"
+            );
+        }
+
+        totals.sort_by_key(|&(total, max_diff, _, _, _)| (max_diff, total));
+        println!("best by max");
+        for (total, max_diff, phase_step, per_sample, radii) in totals.into_iter().take(10) {
+            let phase_deg = f64::from(phase_step) * 0.125;
+            println!(
+                "phase={phase_deg:.3} total={total} max={max_diff} per_sample={per_sample:?} radii={radii:?}"
+            );
+        }
+    }
+
+    fn sample_no_border_with_ring_thresholds(
+        bin: &BinaryImage,
+        geometry: &DyGeometry,
+        rings: &[RingSpec],
+        points_per_ring: u32,
+        theta_offset: f64,
+        reserved: &ReservedAreas<'_>,
+        offsets: (&[f64], &[f64]),
+        code_threshold: f64,
+        decorative_threshold: f64,
+    ) -> Vec<bool> {
+        let mut samples = Vec::with_capacity(rings.len() * points_per_ring as usize);
+        for (ring_idx, ring) in rings.iter().enumerate() {
+            let threshold = if ring.is_decoration {
+                decorative_threshold
+            } else {
+                code_threshold
+            };
+            for point in 0..points_per_ring {
+                let reserved_cell = is_reserved_cell(
+                    ring,
+                    ring_idx as u32,
+                    point,
+                    points_per_ring,
+                    theta_offset,
+                    geometry,
+                    reserved,
+                );
+                let ratio = sample_cell_black_ratio_with_offsets(
+                    bin,
+                    geometry,
+                    ring,
+                    points_per_ring,
+                    theta_offset,
+                    point,
+                    offsets,
+                );
+                samples.push(!reserved_cell && ratio >= threshold);
+            }
+        }
+        samples
+    }
+
+    fn debug_best_no_border_radius_scale(
+        bin: &BinaryImage,
+        geometry: &DyGeometry,
+        points_per_ring: u32,
+        theta_offset: f64,
+        score_offsets: (&[f64], &[f64]),
+        score_threshold: f64,
+        decorative_weight: f64,
+    ) -> f64 {
+        let mut best = (NO_BORDER_STANDARD_RADIUS_SCALE, f64::INFINITY);
+        for radius_step in 396..=414 {
+            let radius_scale = radius_step as f64 / 400.0;
+            let rings = debug_no_border_ring_specs_with_radius_scale(geometry, radius_scale);
+            let code_rings = rings
+                .iter()
+                .copied()
+                .filter(|ring| !ring.is_decoration)
+                .collect::<Vec<_>>();
+            let decorative_rings = rings
+                .iter()
+                .copied()
+                .filter(|ring| ring.is_decoration)
+                .collect::<Vec<_>>();
+            let score = candidate_grid_score_with_offsets(
+                bin,
+                geometry,
+                &code_rings,
+                points_per_ring,
+                theta_offset,
+                score_offsets,
+                score_threshold,
+            ) + candidate_grid_score_with_offsets(
+                bin,
+                geometry,
+                &decorative_rings,
+                points_per_ring,
+                theta_offset,
+                score_offsets,
+                score_threshold,
+            ) * decorative_weight;
+            if score < best.1 {
+                best = (radius_scale, score);
+            }
+        }
+        best.0
+    }
+
+    fn debug_no_border_ring_specs_with_radius_scale(
+        geometry: &DyGeometry,
+        radius_scale: f64,
+    ) -> Vec<RingSpec> {
+        let scale = (geometry.locator_distance / NO_BORDER_STANDARD_LOCATOR_DISTANCE).max(0.01);
+        NO_BORDER_RINGS
+            .iter()
+            .map(|&(radius, half_width, is_decoration)| {
+                let radius = no_border_adjusted_standard_radius(radius);
+                RingSpec {
+                    r_inner: (radius * radius_scale - half_width) * scale,
+                    r_outer: (radius * radius_scale + half_width) * scale,
+                    is_decoration,
+                }
+            })
+            .collect()
     }
 
     #[test]
