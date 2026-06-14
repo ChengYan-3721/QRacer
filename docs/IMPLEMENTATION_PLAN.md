@@ -1063,3 +1063,15 @@ fn grid_sampling_recovers_perfect_qr() {
 4. **细环灰度亚像素积分采样**：细环采样改用转正彩色图的灰度双线性/小扇区积分，降低单像素四舍五入和 Otsu 二值化在细线边缘造成的抖动。
 
 验收重点：`黑框版4细环漏采标注.jpg` 红圈位置的两段细环应连续到徽标外圆附近；`samples/黑框版2/3/4.jpg` 和根目录 `黑框版4.jpg` 不应重新出现徽标圆框误采为细环的问题；编码环仍保持右上徽标保留区内空白。
+
+## 附录 D：无框版装饰环采样与渲染实现（2026-06-14）
+
+无框版抖音码 6 环中 ring0（r=228.66）、ring2（r=188.59）是装饰环，ring1/3/4/5 是编码环。装饰环优化目标是"整段圆弧形状/连续性对得上"（无固定网格点位），参考黑框版 fine-ring 路线，已全部落地。
+
+1. **采样**（`sample_no_border_fine_rings`，`src/codec/dy_grid.rs`）：装饰环改用 720 点（0.5°）高密度独立采样存入 `decorative_rings`，120 点编码环 `grid.rings` 完全不动，保住编码环 100% 逐点精度（`no_border_sampling_matches_svg_marker_fixture` 全样本零 mismatch）。采样后 `close_circular_white_gaps(NO_BORDER_DECORATIVE_FINE_RING_MAX_GAP=6)` 填噪声白缝 + `remove_short_circular_black_runs(MIN_RUN=2)` 去单点噪声。
+
+2. **遮挡**（`no_border_decorative_point_occluded`）：牛眼按 `outer_radius * NO_BORDER_DECORATIVE_FINDER_SKIP_SCALE(1.05)` 判白；badge 改用**固定 layout 几何**而非检测值——`detect_dy_badge` 在无框版8/12/14 把 badge 内侧黑像素圈进去，半径偏大（layout 60.7~65.7 vs 干净样本 56.7~57.7）、中心内移（dist 388~396 vs 412~417），导致 ~298°/332° 两侧真实装饰弧被误删。改用固定 `NO_BORDER_LAYOUT_BADGE_CENTER=(483.49,128.31)` + `NO_BORDER_LAYOUT_BADGE_RADIUS=57.3`（17 个干净样本检测半径中位数），经 `fwd=locator_distance/240.529` 映射到像素，仍 ×`NO_BORDER_DECORATIVE_BADGE_SKIP_SCALE(1.15)`。
+
+3. **渲染**（`dy_no_border_grid_to_svg`，`src/vector/svg.rs`）：装饰环渲染与编码环统一（弃用 `polar_sector_path` 方头扇形）。弧段用 `rounded_arc_bar_path` 圆角端点 + 标准环线宽（half_width 5.0→10.4，与编码同），传入角各内缩 `half_width/radius` 使圆角顶点落回采样 run 边界、弧长不外延；孤立圆点（run 弧长 ≤ `DOUYIN_NO_BORDER_DECORATIVE_DOT_MAX_ARC_SCALE(1.6)` ×线宽）输出 `<circle>` r≈4（radial_step 10×0.5×`single_dot_width_scale` 0.81），比编码点 r=5 略小，匹配 `samples/无框版1.svg` 装饰点。装饰弧角度直接用采样 run 边界算，圆点数量随采样浮动（非固定）。
+
+验收：全部 `samples/无框版1~20` 编码环零 mismatch；无框版8/14 徽标两侧真实装饰弧恢复；`无框版1` 装饰圆点 ring0 7 个 + ring2 2 个，与 `samples/无框版1.svg` 逐点对应；装饰弧 full_span 与采样 run 跨度一致（圆角不外延弧长）。诊断工具 `debug_no_border_decorative_shape`（20 样本 badge layout-radius survey + 逐点遮挡追踪）、`debug_no_border_diff_outputs`（重生成 `target/debug/no_border_debug/无框版N.svg`+corrected.png 供叠图核验）。

@@ -1,7 +1,4 @@
-// QRacer 入口：启动 eframe，把窗口控制交给 QRacerApp。
-//
-// egui 是 immediate-mode GUI：没有"控件树"或"信号槽"，每帧重新执行
-// QRacerApp::update() 把整个 UI 描述一遍。状态全部存在 QRacerApp 结构体里。
+#![windows_subsystem = "windows"]
 
 mod app;
 mod code_kind;

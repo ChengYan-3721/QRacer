@@ -74,6 +74,65 @@ pub fn find_dy_finders(bin: &BinaryImage) -> Vec<DyFinder> {
     candidates
 }
 
+/// 把牛眼中心精修到亚像素：对外环带（[0.55, 1.05] × 外环半径）内的黑像素
+/// 质心做 mean-shift 迭代。连通域质心会被相邻码点或形态学桥接像素带偏
+/// 2~6px，而完整圆环的环带质心收敛到真实圆心；限幅 4px 防止异常发散。
+pub fn refine_dy_finder_center(bin: &BinaryImage, finder: &DyFinder) -> DyFinder {
+    let r_outer = finder.outer_radius();
+    let band_min = r_outer * 0.55;
+    let band_max = r_outer * 1.05;
+    let mut cx = finder.cx;
+    let mut cy = finder.cy;
+
+    for _ in 0..6 {
+        let min_x = (cx - band_max).floor() as i32;
+        let max_x = (cx + band_max).ceil() as i32;
+        let min_y = (cy - band_max).floor() as i32;
+        let max_y = (cy + band_max).ceil() as i32;
+        let mut sum_x = 0.0_f64;
+        let mut sum_y = 0.0_f64;
+        let mut count = 0_u32;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                if !bin.is_black(x, y) {
+                    continue;
+                }
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                let dist = (px - cx).hypot(py - cy);
+                if dist < band_min || dist > band_max {
+                    continue;
+                }
+                sum_x += px;
+                sum_y += py;
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            break;
+        }
+        let next_x = sum_x / f64::from(count);
+        let next_y = sum_y / f64::from(count);
+        if (next_x - finder.cx).abs() > 4.0 || (next_y - finder.cy).abs() > 4.0 {
+            break;
+        }
+        let moved = (next_x - cx).hypot(next_y - cy);
+        cx = next_x;
+        cy = next_y;
+        if moved < 0.05 {
+            break;
+        }
+    }
+
+    DyFinder {
+        cx,
+        cy,
+        rings: finder.rings.clone(),
+    }
+}
+
 pub fn select_dy_finders(finders: &[DyFinder]) -> Option<[DyFinder; 3]> {
     select_dy_finders_raw(finders).map(normalize_dy_finder_triplet)
 }

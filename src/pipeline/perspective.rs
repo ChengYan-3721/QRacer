@@ -1,9 +1,9 @@
 use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, Vector3};
 
-use crate::detect::finder_dy::DyFinder;
+use crate::detect::finder_dy::{DyFinder, refine_dy_finder_center};
 use crate::detect::finder_qr::QrFinder;
 use crate::detect::finder_wx::WxFinder;
-use crate::pipeline::preprocess::BinaryImage;
+use crate::pipeline::preprocess::{BinaryImage, preprocess};
 use image::{DynamicImage, Rgba, RgbaImage};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -292,6 +292,10 @@ pub fn warp_dy_to_upright_image_with_top_right(
         ));
     };
 
+    warp_image_with_inverse(image, &inv, size)
+}
+
+fn warp_image_with_inverse(image: &DynamicImage, inv: &Matrix3<f64>, size: u32) -> DynamicImage {
     let source = image.to_rgba8();
     let mut out = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
     for y in 0..size {
@@ -309,45 +313,198 @@ pub fn warp_dy_to_upright_image_with_top_right(
     DynamicImage::ImageRgba8(out)
 }
 
-#[cfg(test)]
-pub fn warp_dy_to_upright_image_with_top_right_offset(
+pub struct DyUprightCorrection {
+    pub source: DynamicImage,
+    pub binary: BinaryImage,
+    pub finders: [DyFinder; 3],
+}
+
+/// 抖音码统一校正管线：牛眼中心亚像素精修 + 透视校正到正立 + 重新二值化。
+///
+/// 主程序 `process_dy_image` 与所有无框版调参测试都必须经过该函数，
+/// 保证 debug diff 输出与实际校正预览基于同一份采样输入。
+///
+/// 精修后若三枚定位点本来就接近轴对齐（两条腿倾角都小于
+/// `DY_UPRIGHT_SNAP_MAX_TILT_DEG`），判定原图为标准正立图，改用无旋转的
+/// 相似变换（均匀缩放 + 平移）：该变换不可能引入旋转或透视，检测误差只会
+/// 化为亚像素级的平移/缩放残差，不会把正立原图校歪。只有真正倾斜或带
+/// 透视的输入才走 badge 锚点 + 单应变换路径。
+pub fn correct_dy_to_upright(
     image: &DynamicImage,
+    raw_binary: &BinaryImage,
+    raw_selected: &[DyFinder; 3],
+) -> DyUprightCorrection {
+    let refined = [
+        refine_dy_finder_center(raw_binary, &raw_selected[0]),
+        refine_dy_finder_center(raw_binary, &raw_selected[1]),
+        refine_dy_finder_center(raw_binary, &raw_selected[2]),
+    ];
+    let size = image.width().max(image.height()).clamp(1024, 1600);
+    let top_right = detect_dy_badge_anchor(image, &refined).map(|badge| (badge.cx, badge.cy));
+    let source = if let Some(top_right) = top_right {
+        if let Some(inv) = dy_upright_badge_snap_inverse(&refined, top_right, size) {
+            warp_image_with_inverse(image, &inv, size)
+        } else if let Some(inv) = dy_upright_snap_inverse(&refined, size) {
+            warp_image_with_inverse(image, &inv, size)
+        } else {
+            warp_dy_to_upright_image_with_top_right(image, &refined, Some(top_right), size)
+        }
+    } else if let Some(inv) = dy_upright_snap_inverse(&refined, size) {
+        warp_image_with_inverse(image, &inv, size)
+    } else {
+        warp_dy_to_upright_image_with_top_right(image, &refined, None, size)
+    };
+    let binary = preprocess(&source);
+    let finders = dy_upright_target_finders(&refined, size);
+    DyUprightCorrection {
+        source,
+        binary,
+        finders,
+    }
+}
+
+/// 判定为"本来就是正立图"的最大腿倾角。定位点检测误差通常表现为
+/// 1 度以内的伪倾斜；真实拍摄倾斜一般明显大于该值。
+const DY_UPRIGHT_SNAP_MAX_TILT_DEG: f64 = 1.5;
+
+/// 正立吸附：三点最小二乘的无旋转相似变换（目标像素 → 源像素）。
+fn dy_upright_snap_inverse(finders: &[DyFinder; 3], target_size: u32) -> Option<Matrix3<f64>> {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let bl = &ordered[1];
+    let br = &ordered[2];
+    let bottom_tilt = (br.cy - bl.cy).atan2(br.cx - bl.cx);
+    let left_tilt = (bl.cx - tl.cx).atan2(bl.cy - tl.cy);
+    let max_tilt = DY_UPRIGHT_SNAP_MAX_TILT_DEG.to_radians();
+    if bottom_tilt.abs() > max_tilt || left_tilt.abs() > max_tilt {
+        return None;
+    }
+
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let target_leg = far - margin;
+    let source_leg = (dy_distance(tl, bl) + dy_distance(bl, br)) * 0.5;
+    if source_leg <= f64::EPSILON {
+        return None;
+    }
+
+    let scale = target_leg / source_leg;
+    let src_mean = ((tl.cx + bl.cx + br.cx) / 3.0, (tl.cy + bl.cy + br.cy) / 3.0);
+    let dst_mean = ((margin * 2.0 + far) / 3.0, (margin + far * 2.0) / 3.0);
+    let tx = dst_mean.0 - scale * src_mean.0;
+    let ty = dst_mean.1 - scale * src_mean.1;
+
+    Some(Matrix3::new(
+        1.0 / scale,
+        0.0,
+        -tx / scale,
+        0.0,
+        1.0 / scale,
+        -ty / scale,
+        0.0,
+        0.0,
+        1.0,
+    ))
+}
+
+fn dy_upright_badge_snap_inverse(
     finders: &[DyFinder; 3],
-    top_right: Option<(f64, f64)>,
+    top_right: (f64, f64),
+    target_size: u32,
+) -> Option<Matrix3<f64>> {
+    dy_upright_badge_snap_inverse_with_offset(
+        finders,
+        top_right,
+        target_size,
+        DY_BADGE_CENTER_DX_PER_LOCATOR_LEG,
+        DY_BADGE_CENTER_DY_PER_LOCATOR_LEG,
+    )
+}
+
+fn dy_upright_badge_snap_inverse_with_offset(
+    finders: &[DyFinder; 3],
+    top_right: (f64, f64),
     target_size: u32,
     dx_per_locator_leg: f64,
     dy_per_locator_leg: f64,
-) -> DynamicImage {
-    let size = target_size.max(1);
-    let Some(inv) = dy_upright_to_source_homography_with_badge_offset(
-        finders,
-        top_right,
-        size,
-        dx_per_locator_leg,
-        dy_per_locator_leg,
-    ) else {
-        return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
-            size,
-            size,
-            Rgba([255, 255, 255, 255]),
-        ));
-    };
-
-    let source = image.to_rgba8();
-    let mut out = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
-    for y in 0..size {
-        for x in 0..size {
-            let p = inv * Vector3::new(x as f64, y as f64, 1.0);
-            if p.z.abs() < f64::EPSILON {
-                continue;
-            }
-            let sx = p.x / p.z;
-            let sy = p.y / p.z;
-            out.put_pixel(x, y, bilinear_sample_rgba(&source, sx, sy));
-        }
+) -> Option<Matrix3<f64>> {
+    let ordered = order_dy_finders(finders);
+    let bottom_tilt = (ordered[2].cy - ordered[1].cy).atan2(ordered[2].cx - ordered[1].cx);
+    let left_tilt = (ordered[1].cx - ordered[0].cx).atan2(ordered[1].cy - ordered[0].cy);
+    let max_tilt = DY_UPRIGHT_SNAP_MAX_TILT_DEG.to_radians();
+    if bottom_tilt.abs() > max_tilt || left_tilt.abs() > max_tilt {
+        return None;
     }
 
-    DynamicImage::ImageRgba8(out)
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let target_leg = far - margin;
+    let target_badge = (
+        far + dx_per_locator_leg * target_leg,
+        margin + dy_per_locator_leg * target_leg,
+    );
+    let target = [(margin, margin), target_badge, (margin, far), (far, far)];
+    let source = [
+        (ordered[0].cx, ordered[0].cy),
+        top_right,
+        (ordered[1].cx, ordered[1].cy),
+        (ordered[2].cx, ordered[2].cy),
+    ];
+
+    no_rotation_similarity_inverse(&source, &target)
+}
+
+fn no_rotation_similarity_inverse(
+    source: &[(f64, f64)],
+    target: &[(f64, f64)],
+) -> Option<Matrix3<f64>> {
+    if source.len() < 2 || source.len() != target.len() {
+        return None;
+    }
+
+    let count = source.len() as f64;
+    let source_center = (
+        source.iter().map(|point| point.0).sum::<f64>() / count,
+        source.iter().map(|point| point.1).sum::<f64>() / count,
+    );
+    let target_center = (
+        target.iter().map(|point| point.0).sum::<f64>() / count,
+        target.iter().map(|point| point.1).sum::<f64>() / count,
+    );
+    let mut dot = 0.0;
+    let mut source_norm2 = 0.0;
+
+    for (source, target) in source.iter().zip(target) {
+        let sx = source.0 - source_center.0;
+        let sy = source.1 - source_center.1;
+        let tx = target.0 - target_center.0;
+        let ty = target.1 - target_center.1;
+        dot += sx * tx + sy * ty;
+        source_norm2 += sx * sx + sy * sy;
+    }
+    if source_norm2 <= f64::EPSILON {
+        return None;
+    }
+
+    let scale = dot / source_norm2;
+    if scale.abs() <= f64::EPSILON {}
+
+    let tx = target_center.0 - scale * source_center.0;
+    let ty = target_center.1 - scale * source_center.1;
+
+    Some(Matrix3::new(
+        1.0 / scale,
+        0.0,
+        -tx / scale,
+        0.0,
+        1.0 / scale,
+        -ty / scale,
+        0.0,
+        0.0,
+        1.0,
+    ))
 }
 
 pub fn detect_dy_badge_anchor(
