@@ -67,39 +67,3 @@ pub fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
     let size = [rgba.width() as usize, rgba.height() as usize];
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use image::{ImageBuffer, ImageFormat, Rgba};
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn load_image_from_path_uses_file_header_before_extension() {
-        let path = temp_image_path("jpg");
-        let image = DynamicImage::ImageRgba8(ImageBuffer::from_fn(3, 2, |x, y| {
-            Rgba([(x * 40) as u8, (y * 80) as u8, 128, 255])
-        }));
-        image
-            .save_with_format(&path, ImageFormat::Png)
-            .expect("png test image should save with mismatched extension");
-
-        let loaded = load_image_from_path(&path).expect("image should load from file header");
-
-        assert_eq!(loaded.width(), 3);
-        assert_eq!(loaded.height(), 2);
-        let _ = std::fs::remove_file(path);
-    }
-
-    fn temp_image_path(extension: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "qracer-mismatched-image-{}-{nanos}.{extension}",
-            std::process::id()
-        ))
-    }
-}

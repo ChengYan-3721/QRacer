@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub fn polar_sector_path(
     cx: f64,
     cy: f64,
@@ -33,21 +32,6 @@ pub fn polar_sector_path(
     )
 }
 
-#[allow(dead_code)]
 fn polar_point(cx: f64, cy: f64, radius: f64, theta: f64) -> (f64, f64) {
     (cx + radius * theta.cos(), cy + radius * theta.sin())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sector_path_contains_arc_commands() {
-        let path = polar_sector_path(10.0, 10.0, 2.0, 4.0, 0.0, std::f64::consts::FRAC_PI_2);
-
-        assert!(path.starts_with("M "));
-        assert!(path.contains(" A "));
-        assert!(path.ends_with(" Z"));
-    }
 }

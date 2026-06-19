@@ -17,5 +17,4 @@ pub enum QRacerError {
     ImageFormat(String),
 }
 
-#[allow(dead_code)]
 pub type Result<T> = std::result::Result<T, QRacerError>;

@@ -3,7 +3,6 @@
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Qr/WxMiniprogram/Douyin 阶段 2 起由 detect 模块构造
 pub enum CodeKind {
     Unknown,
     Qr,

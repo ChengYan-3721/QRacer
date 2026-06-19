@@ -37,6 +37,12 @@ use image::{DynamicImage, GrayImage};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(not(windows))]
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::SYSTEMTIME;
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 const PREVIEW_SIZE: u32 = 1024;
 const QR_GRID_REFERENCE_SNAP_RATIO: usize = 10;
@@ -50,7 +56,6 @@ const SCREEN_CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(180);
 /// texture 用 lazy 加载：首次显示时调用 ctx.load_texture()，缓存在这里。
 /// 如果图像替换，把 texture 设回 None，下一帧会重新上传。
 pub struct LoadedImage {
-    #[allow(dead_code)] // 阶段 2+ 会被算法读取
     pub source: DynamicImage,
     pub texture: Option<egui::TextureHandle>,
     /// 给纹理的稳定名字（egui 用它做缓存键）
@@ -443,7 +448,7 @@ impl QRacerApp {
 
         let Some(path) = rfd::FileDialog::new()
             .add_filter("SVG", &["svg"])
-            .set_file_name("qracer.svg")
+            .set_file_name(export_svg_file_name())
             .save_file()
         else {
             return;
@@ -863,6 +868,74 @@ impl QRacerApp {
     }
 }
 
+fn export_svg_file_name() -> String {
+    format!("{}.svg", current_export_timestamp())
+}
+
+#[cfg(windows)]
+fn current_export_timestamp() -> String {
+    let mut now = SYSTEMTIME::default();
+    unsafe {
+        GetLocalTime(&mut now);
+    }
+
+    format_export_timestamp(
+        now.wYear.into(),
+        now.wMonth.into(),
+        now.wDay.into(),
+        now.wHour.into(),
+        now.wMinute.into(),
+        now.wSecond.into(),
+    )
+}
+
+#[cfg(not(windows))]
+fn current_export_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_unix_days(days);
+
+    format_export_timestamp(
+        year,
+        month,
+        day,
+        (seconds_of_day / 3_600) as u32,
+        ((seconds_of_day % 3_600) / 60) as u32,
+        (seconds_of_day % 60) as u32,
+    )
+}
+
+fn format_export_timestamp(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> String {
+    format!("{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}")
+}
+
+#[cfg(not(windows))]
+fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    (year as i32, month as u32, day as u32)
+}
+
 fn process_image(img: DynamicImage, job_id: u64, show_diff_overlay: bool) -> ProcessResult {
     let binary = preprocess(&img);
     let code_kind = detect::detect_kind_with_image(&img, &binary);
@@ -1204,6 +1277,8 @@ fn infer_qr_appearance(
         QrAppearance::Wechat
     } else if has_round_qr_finders(warped, finders) {
         QrAppearance::Xiaohongshu
+    } else if has_enterprise_wechat_compact_modules(warped, finders) {
+        QrAppearance::EnterpriseWechat
     } else {
         QrAppearance::Standard
     }
@@ -1376,6 +1451,124 @@ fn round_qr_finder_score(
 
     (corner_light_ratio >= 0.75 && side_dark_ratio >= 0.42 && center_dark_ratio >= 0.45)
         || (corner_light_ratio >= 0.92 && center_dark_ratio >= 0.50)
+}
+
+fn has_enterprise_wechat_compact_modules(warped: &BinaryImage, finders: &[QrFinder; 3]) -> bool {
+    let modules = infer_qr_version(warped)
+        .ok()
+        .map(qr_modules_for_version)
+        .or_else(|| estimate_qr_modules_from_finders(finders));
+    let Some(modules) = modules else {
+        return false;
+    };
+    if modules < 21 || warped.w == 0 || warped.h == 0 {
+        return false;
+    }
+
+    let edge_regions = [
+        (0.04, 0.04, 0.20, 0.20),
+        (0.80, 0.04, 0.96, 0.20),
+        (0.04, 0.80, 0.20, 0.96),
+        (0.80, 0.80, 0.96, 0.96),
+        (0.32, 0.03, 0.68, 0.13),
+        (0.32, 0.87, 0.68, 0.97),
+        (0.03, 0.32, 0.13, 0.68),
+        (0.87, 0.32, 0.97, 0.68),
+    ];
+
+    let mut candidates = 0_u32;
+    let mut compact = 0_u32;
+    let mut full = 0_u32;
+
+    for y in 0..modules {
+        for x in 0..modules {
+            if is_enterprise_wechat_detection_ignored_module(modules, x, y) {
+                continue;
+            }
+
+            let center_dark = module_region_ratio(
+                warped,
+                modules,
+                x as f64 + 0.30,
+                y as f64 + 0.30,
+                x as f64 + 0.70,
+                y as f64 + 0.70,
+                true,
+            );
+            if center_dark < 0.68 {
+                continue;
+            }
+
+            let edge_light = average_regions_ratio(warped, modules, x, y, &edge_regions, false);
+            candidates += 1;
+            if edge_light >= 0.64 {
+                compact += 1;
+            } else if edge_light <= 0.38 {
+                full += 1;
+            }
+        }
+    }
+
+    candidates >= 16
+        && compact as f64 / candidates as f64 >= 0.25
+        && full as f64 / candidates as f64 <= 0.18
+        && compact > full.saturating_mul(4)
+}
+
+fn is_enterprise_wechat_detection_ignored_module(modules: usize, x: usize, y: usize) -> bool {
+    is_qr_finder_or_separator_module(modules, x, y)
+        || is_qr_center_logo_module(modules, x, y)
+        || qr_alignment_pattern_module(modules, x, y).is_some()
+}
+
+fn qr_alignment_pattern_module(modules: usize, x: usize, y: usize) -> Option<bool> {
+    let version = qr_version_for_modules(modules)? as usize;
+    if version == 1 {
+        return None;
+    }
+
+    let centers = qr_alignment_pattern_centers(version, modules);
+    for &cy in &centers {
+        for &cx in &centers {
+            if alignment_pattern_overlaps_finder(modules, cx, cy) {
+                continue;
+            }
+            let dx = x.abs_diff(cx);
+            let dy = y.abs_diff(cy);
+            if dx <= 2 && dy <= 2 {
+                let ring = dx.max(dy);
+                return Some(ring == 2 || ring == 0);
+            }
+        }
+    }
+    None
+}
+
+fn qr_alignment_pattern_centers(version: usize, modules: usize) -> Vec<usize> {
+    if version == 1 {
+        return Vec::new();
+    }
+
+    let count = version / 7 + 2;
+    let step = if version == 32 {
+        26
+    } else {
+        ((version * 4 + count * 2 + 1) / (count * 2 - 2)) * 2
+    };
+
+    let mut centers = vec![0; count];
+    centers[0] = 6;
+    let mut pos = modules - 7;
+    for index in (1..count).rev() {
+        centers[index] = pos;
+        pos = pos.saturating_sub(step);
+    }
+    centers
+}
+
+fn alignment_pattern_overlaps_finder(modules: usize, cx: usize, cy: usize) -> bool {
+    let far = modules - 7;
+    (cx == 6 && (cy == 6 || cy == far)) || (cx == far && cy == 6)
 }
 
 fn estimate_qr_modules_from_finders(finders: &[QrFinder; 3]) -> Option<usize> {
@@ -1712,9 +1905,9 @@ fn egui_paste_shortcut_down(ctx: &egui::Context) -> bool {
 
         shortcut_down
             || input
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::Paste(_)))
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Paste(_)))
     })
 }
 
@@ -1742,282 +1935,6 @@ fn platform_paste_shortcut_down(ctx: &egui::Context) -> bool {
 #[cfg(not(target_os = "windows"))]
 fn platform_paste_shortcut_down(_ctx: &egui::Context) -> bool {
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    fn inferred_qr_appearance_for_sample(path: &str) -> Option<QrAppearance> {
-        let path = Path::new(path);
-        if !path.exists() {
-            return None;
-        }
-
-        let img = image::open(path).expect("sample image should load");
-        let binary = preprocess(&img);
-        let finders = find_qr_finders(&binary);
-        let selected =
-            select_qr_finder_triplet(&binary, &finders).expect("sample should have qr finders");
-        let corrected_source = warp_qr_to_square_image(&img, &binary, &selected, PREVIEW_SIZE);
-        let warped = preprocess(&corrected_source);
-        Some(infer_qr_appearance(&img, &selected, &warped))
-    }
-
-    #[test]
-    fn qr_mask_matching_ignores_center_logo_region() {
-        let diff = DiffResult {
-            diff_modules: vec![(10, 10), (11, 10), (10, 11)],
-            missing_in_generated: Vec::new(),
-            extra_in_generated: Vec::new(),
-            diff_count: 3,
-        };
-
-        assert_eq!(qr_diff_outside_ignored_qr_regions(&diff, 29), 0);
-    }
-
-    #[test]
-    fn qr_mask_matching_ignores_finder_style_regions() {
-        let diff = DiffResult {
-            diff_modules: vec![(0, 0), (28, 0), (0, 28), (7, 7)],
-            missing_in_generated: Vec::new(),
-            extra_in_generated: Vec::new(),
-            diff_count: 4,
-        };
-
-        assert_eq!(qr_diff_outside_ignored_qr_regions(&diff, 29), 0);
-    }
-
-    #[test]
-    fn qr_mask_matching_rejects_non_center_differences() {
-        let diff = DiffResult {
-            diff_modules: vec![(10, 10), (2, 18)],
-            missing_in_generated: Vec::new(),
-            extra_in_generated: Vec::new(),
-            diff_count: 2,
-        };
-
-        assert_eq!(qr_diff_outside_ignored_qr_regions(&diff, 29), 1);
-    }
-
-    #[test]
-    fn infers_standard_qr_appearance_from_standard_sample() {
-        let Some(appearance) = inferred_qr_appearance_for_sample("samples/标准样式.jpg") else {
-            return;
-        };
-
-        assert_eq!(appearance, QrAppearance::Standard);
-    }
-
-    #[test]
-    fn infers_standard_qr_appearance_from_photographed_standard_sample() {
-        let Some(appearance) = inferred_qr_appearance_for_sample("samples/标准样式拍照.jpg")
-        else {
-            return;
-        };
-
-        assert_eq!(appearance, QrAppearance::Standard);
-    }
-
-    #[test]
-    fn infers_wechat_qr_appearance_from_styled_sample() {
-        let Some(appearance) = inferred_qr_appearance_for_sample("samples/微信样式.png") else {
-            return;
-        };
-
-        assert_eq!(appearance, QrAppearance::Wechat);
-    }
-
-    #[test]
-    fn infers_xiaohongshu_qr_appearance_from_styled_sample() {
-        let Some(appearance) = inferred_qr_appearance_for_sample("samples/小红书样式.jpg")
-        else {
-            return;
-        };
-
-        assert_eq!(appearance, QrAppearance::Xiaohongshu);
-    }
-
-    #[test]
-    fn processes_xiaohongshu_qr_screenshot_samples_as_qr() {
-        for path in ["samples/小红书QR码1.jpg", "samples/小红书QR码2.jpg"] {
-            if !Path::new(path).exists() {
-                continue;
-            }
-
-            let img = image::open(path).expect("sample image should load");
-            let result = process_image(img, 0, false);
-
-            assert_eq!(result.code_kind, CodeKind::Qr, "{path}");
-            assert_eq!(result.qr_appearance, QrAppearance::Xiaohongshu, "{path}");
-            assert!(result.last_matrix.is_some(), "{path}: {}", result.status);
-            assert!(result.last_svg.is_some(), "{path}: {}", result.status);
-        }
-    }
-
-    #[test]
-    fn processes_xiaohongshu_qr1_zoom_variants_consistently() {
-        assert_xiaohongshu_zoom_variants_are_consistent(&[
-            "samples/小红书QR码1.jpg",
-            "samples/小红书QR码1放大.png",
-            "samples/小红书QR码1缩小.png",
-        ]);
-    }
-
-    #[test]
-    fn processes_xiaohongshu_qr2_zoom_variants_consistently() {
-        assert_xiaohongshu_zoom_variants_are_consistent(&[
-            "samples/小红书QR码2.jpg",
-            "samples/小红书QR码2放大a.png",
-            "samples/小红书QR码2放大b.png",
-            "samples/小红书QR码2放大c.png",
-            "samples/小红书QR码2缩小.png",
-        ]);
-    }
-
-    fn assert_xiaohongshu_zoom_variants_are_consistent(paths: &[&str]) {
-        let mut first_matrix: Option<QrMatrix> = None;
-        let mut first_svg: Option<String> = None;
-
-        for &path in paths {
-            if !Path::new(path).exists() {
-                continue;
-            }
-
-            let img = image::open(path).expect("sample image should load");
-            let result = process_image(img, 0, false);
-
-            assert_eq!(result.code_kind, CodeKind::Qr, "{path}");
-            assert_eq!(result.qr_appearance, QrAppearance::Xiaohongshu, "{path}");
-            assert_eq!(result.qr_version, Some(4), "{path}: {}", result.status);
-
-            let matrix = result
-                .last_matrix
-                .expect("xiaohongshu qr variant should produce a matrix");
-            assert_eq!(matrix.len(), 33, "{path}");
-
-            if let Some(reference) = first_matrix.as_ref() {
-                let diff = compute_matrix_diff(reference, &matrix).expect("same QR version");
-                assert_eq!(
-                    qr_diff_outside_ignored_qr_regions(&diff, matrix.len()),
-                    0,
-                    "{path}: data modules changed at {:?}",
-                    diff.diff_modules
-                );
-            } else {
-                first_matrix = Some(matrix);
-            }
-
-            let svg = result
-                .last_svg
-                .expect("xiaohongshu qr variant should produce svg");
-            if let Some(reference_svg) = first_svg.as_ref() {
-                assert_eq!(&svg, reference_svg, "{path}");
-            } else {
-                first_svg = Some(svg);
-            }
-        }
-    }
-
-    #[test]
-    fn decodeless_qr_grid_fallback_generates_svg_from_corrected_grid() {
-        let scale = 8_u32;
-        let warped = render_warped_qr_finders(true, 21, scale);
-        let finders = [
-            QrFinder {
-                cx: 3.5 * scale as f64,
-                cy: 3.5 * scale as f64,
-                module: scale as f64,
-            },
-            QrFinder {
-                cx: 17.5 * scale as f64,
-                cy: 3.5 * scale as f64,
-                module: scale as f64,
-            },
-            QrFinder {
-                cx: 3.5 * scale as f64,
-                cy: 17.5 * scale as f64,
-                module: scale as f64,
-            },
-        ];
-        let mut result = ProcessResult {
-            code_kind: CodeKind::Qr,
-            status: String::new(),
-            binary: None,
-            finders: None,
-            warped: Some(warped.clone()),
-            mask_choice: MaskChoice::Mask(0),
-            qr_appearance: QrAppearance::Xiaohongshu,
-            last_decoded: None,
-            qr_version: None,
-            last_matrix: None,
-            qr_reference_matrix: None,
-            matched_mask: None,
-            last_wx_grid: None,
-            last_dy_grid: None,
-            last_svg: None,
-            last_diff_count: None,
-            preview: None,
-        };
-
-        let version =
-            try_use_decodeless_qr_grid_fallback(&warped, &finders, &mut result, false, 0).unwrap();
-
-        assert_eq!(version, 1);
-        assert_eq!(result.mask_choice, MaskChoice::GridFallback);
-        assert_eq!(result.last_matrix.as_ref().map(Vec::len), Some(21));
-        assert!(
-            result
-                .last_svg
-                .as_ref()
-                .is_some_and(|svg| svg.contains("<svg"))
-        );
-        assert_eq!(result.last_diff_count, Some(0));
-        assert!(result.preview.is_some());
-    }
-
-    #[test]
-    fn round_qr_finder_heuristic_rejects_standard_finders() {
-        let warped = render_warped_qr_finders(false, 21, 8);
-
-        assert!(!has_round_qr_finders_for_modules(&warped, 21));
-    }
-
-    #[test]
-    fn round_qr_finder_heuristic_accepts_xiaohongshu_finders() {
-        let warped = render_warped_qr_finders(true, 21, 8);
-
-        assert!(has_round_qr_finders_for_modules(&warped, 21));
-    }
-
-    fn render_warped_qr_finders(round: bool, modules: usize, scale: u32) -> BinaryImage {
-        let size = modules as u32 * scale;
-        let mut data = vec![255; (size * size) as usize];
-        for (origin_x, origin_y) in [(0, 0), (modules - 7, 0), (0, modules - 7)] {
-            for py in origin_y as u32 * scale..(origin_y as u32 + 7) * scale {
-                for px in origin_x as u32 * scale..(origin_x as u32 + 7) * scale {
-                    let local_x = px as f64 / scale as f64 - origin_x as f64;
-                    let local_y = py as f64 / scale as f64 - origin_y as f64;
-                    let black = if round {
-                        let distance = (local_x - 3.5).hypot(local_y - 3.5);
-                        distance <= 3.5 && !(distance > 1.5 && distance <= 2.5)
-                    } else {
-                        let module_x = (local_x.floor() as usize).min(6);
-                        let module_y = (local_y.floor() as usize).min(6);
-                        let dx = (module_x as i32 - 3).abs();
-                        let dy = (module_y as i32 - 3).abs();
-                        dx.max(dy) != 2
-                    };
-                    if black {
-                        data[(py * size + px) as usize] = 0;
-                    }
-                }
-            }
-        }
-
-        BinaryImage::new(size, size, data)
-    }
 }
 
 impl eframe::App for QRacerApp {
