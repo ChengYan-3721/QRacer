@@ -129,6 +129,7 @@ pub struct QRacerApp {
     paste_shortcut_was_down: bool,
     processing_job: Option<ProcessingJob>,
     capture_job: Option<CaptureJob>,
+    support_dialog: ui::support_dialog::SupportDialog,
     next_job_id: u64,
 }
 
@@ -195,8 +196,13 @@ impl QRacerApp {
             paste_shortcut_was_down: false,
             processing_job: None,
             capture_job: None,
+            support_dialog: ui::support_dialog::SupportDialog::new(),
             next_job_id: 0,
         }
+    }
+
+    pub fn open_support(&mut self) {
+        self.support_dialog.open();
     }
 
     /// 把图像装载为原图，并把识别/校正/矢量化放到后台线程。
@@ -460,7 +466,12 @@ impl QRacerApp {
         };
 
         match std::fs::write(&path, svg) {
-            Ok(()) => self.status = format!("已导出 SVG：{}", path.display()),
+            Ok(()) => {
+                self.status = format!(
+                    "已导出 SVG：{}。本软件不承诺采样结果的正确性，请谨慎用于生产！",
+                    path.display()
+                )
+            }
             Err(error) => self.status = format!("导出 SVG 失败：{error}"),
         }
     }
@@ -476,7 +487,11 @@ impl QRacerApp {
         };
 
         match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(svg)) {
-            Ok(()) => self.status = String::from("已复制 SVG 代码到剪贴板"),
+            Ok(()) => {
+                self.status = String::from(
+                    "已复制 SVG 代码到剪贴板。本软件不承诺采样结果的正确性，请谨慎用于生产！",
+                )
+            }
             Err(error) => self.status = format!("复制 SVG 失败：{error}"),
         }
     }
@@ -1905,9 +1920,9 @@ fn egui_paste_shortcut_down(ctx: &egui::Context) -> bool {
 
         shortcut_down
             || input
-            .events
-            .iter()
-            .any(|event| matches!(event, egui::Event::Paste(_)))
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)))
     })
 }
 
@@ -1956,6 +1971,7 @@ impl eframe::App for QRacerApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui_| {
             ui::toolbar::show(ui_, self, ctx);
         });
+        self.support_dialog.show(ctx);
 
         // 底部状态栏
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui_| {

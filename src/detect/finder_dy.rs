@@ -78,6 +78,24 @@ pub fn find_dy_finders(bin: &BinaryImage) -> Vec<DyFinder> {
 /// 质心做 mean-shift 迭代。连通域质心会被相邻码点或形态学桥接像素带偏
 /// 2~6px，而完整圆环的环带质心收敛到真实圆心；限幅 4px 防止异常发散。
 pub fn refine_dy_finder_center(bin: &BinaryImage, finder: &DyFinder) -> DyFinder {
+    refine_dy_finder_center_from_outer_ring(bin, finder)
+}
+
+pub fn refine_dy_finder_center_from_center_dot(bin: &BinaryImage, finder: &DyFinder) -> DyFinder {
+    let refined = refine_dy_finder_center_from_outer_ring(bin, finder);
+    let r_outer = finder.outer_radius();
+    if let Some((dot_x, dot_y)) = refine_dy_finder_center_dot(bin, finder, r_outer) {
+        DyFinder {
+            cx: dot_x,
+            cy: dot_y,
+            rings: refined.rings,
+        }
+    } else {
+        refined
+    }
+}
+
+fn refine_dy_finder_center_from_outer_ring(bin: &BinaryImage, finder: &DyFinder) -> DyFinder {
     let r_outer = finder.outer_radius();
     let band_min = r_outer * 0.55;
     let band_max = r_outer * 1.05;
@@ -131,6 +149,54 @@ pub fn refine_dy_finder_center(bin: &BinaryImage, finder: &DyFinder) -> DyFinder
         cy,
         rings: finder.rings.clone(),
     }
+}
+
+fn refine_dy_finder_center_dot(
+    bin: &BinaryImage,
+    finder: &DyFinder,
+    r_outer: f64,
+) -> Option<(f64, f64)> {
+    if r_outer <= f64::EPSILON {
+        return None;
+    }
+
+    let radius = r_outer * 0.30;
+    let min_x = (finder.cx - radius).floor() as i32;
+    let max_x = (finder.cx + radius).ceil() as i32;
+    let min_y = (finder.cy - radius).floor() as i32;
+    let max_y = (finder.cy + radius).ceil() as i32;
+    let mut sum_x = 0.0_f64;
+    let mut sum_y = 0.0_f64;
+    let mut count = 0_u32;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            if !bin.is_black(x, y) {
+                continue;
+            }
+            let px = x as f64 + 0.5;
+            let py = y as f64 + 0.5;
+            if (px - finder.cx).hypot(py - finder.cy) > radius {
+                continue;
+            }
+            sum_x += px;
+            sum_y += py;
+            count += 1;
+        }
+    }
+
+    let min_area = (r_outer * r_outer * 0.010).max(3.0) as u32;
+    if count < min_area {
+        return None;
+    }
+
+    let cx = sum_x / f64::from(count);
+    let cy = sum_y / f64::from(count);
+    if (cx - finder.cx).hypot(cy - finder.cy) > r_outer * 0.22 {
+        return None;
+    }
+
+    Some((cx, cy))
 }
 
 pub fn select_dy_finders(finders: &[DyFinder]) -> Option<[DyFinder; 3]> {

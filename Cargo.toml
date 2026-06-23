@@ -11,7 +11,7 @@ egui = "0.32"
 egui_extras = { version = "0.32", features = ["image"] }
 
 # 图像编解码（PNG/JPG/BMP/WebP）
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "ico", "webp"] }
 imageproc = "0.25"
 nalgebra = "0.33"
 
@@ -36,6 +36,9 @@ rfd = "0.15"
 # 错误处理
 anyhow = "1"
 thiserror = "2"
+
+[build-dependencies]
+embed-resource = "3.0"
 
 [profile.release]
 codegen-units = 1 # 允许 LLVM 执行更好的优化。

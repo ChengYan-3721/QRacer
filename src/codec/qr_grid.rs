@@ -1,4 +1,4 @@
-use crate::codec::qr::{estimate_module_count, QrMatrix};
+use crate::codec::qr::{QrMatrix, estimate_module_count};
 use crate::error::{QRacerError, Result};
 use crate::pipeline::preprocess::BinaryImage;
 

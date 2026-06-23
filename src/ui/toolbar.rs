@@ -38,5 +38,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
                 .strong()
                 .color(egui::Color32::from_rgb(60, 130, 220)),
         );
+
+        ui.separator();
+
+        if ui.button("支持").clicked() {
+            app.open_support();
+        }
     });
 }

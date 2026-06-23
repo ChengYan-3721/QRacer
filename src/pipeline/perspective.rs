@@ -1,6 +1,8 @@
 use nalgebra::{DMatrix, DVector, Matrix3, SMatrix, SVector, Vector3};
 
-use crate::detect::finder_dy::{DyFinder, refine_dy_finder_center};
+use crate::detect::finder_dy::{
+    DyFinder, refine_dy_finder_center, refine_dy_finder_center_from_center_dot,
+};
 use crate::detect::finder_qr::QrFinder;
 use crate::detect::finder_wx::WxFinder;
 use crate::pipeline::preprocess::{BinaryImage, preprocess};
@@ -298,23 +300,133 @@ pub fn correct_dy_to_upright(
         refine_dy_finder_center(raw_binary, &raw_selected[1]),
         refine_dy_finder_center(raw_binary, &raw_selected[2]),
     ];
-    let size = image.width().max(image.height()).clamp(1024, 1600);
-    let top_right = detect_dy_badge_anchor(image, &refined).map(|badge| (badge.cx, badge.cy));
-    let source = if let Some(top_right) = top_right {
-        if let Some(inv) = dy_upright_badge_snap_inverse(&refined, top_right, size) {
-            warp_image_with_inverse(image, &inv, size)
-        } else if let Some(inv) = dy_upright_snap_inverse(&refined, size) {
-            warp_image_with_inverse(image, &inv, size)
-        } else {
-            warp_dy_to_upright_image_with_top_right(image, &refined, Some(top_right), size)
+    if false && is_standard_dy_upright_input(&refined) {
+        if dy_direct_no_border_correction_candidate_allowed(image)
+            && !dy_corrected_has_black_border(raw_binary, &refined)
+        {
+            let size = image.width().max(image.height()).clamp(1024, 1600);
+            let correction = correct_dy_to_upright_with_refined(image, &refined, size);
+            if !dy_corrected_has_black_border(&correction.binary, &correction.finders) {
+                let direct_score = dy_corrected_no_border_score(raw_binary, &refined);
+                let corrected_score =
+                    dy_corrected_no_border_score(&correction.binary, &correction.finders);
+                if corrected_score + DY_DIRECT_NO_BORDER_CORRECTION_SCORE_MARGIN < direct_score {
+                    return correction;
+                }
+            }
         }
-    } else if let Some(inv) = dy_upright_snap_inverse(&refined, size) {
-        warp_image_with_inverse(image, &inv, size)
-    } else {
-        warp_dy_to_upright_image_with_top_right(image, &refined, None, size)
-    };
-    let binary = preprocess(&source);
-    let finders = dy_upright_target_finders(&refined, size);
+        return DyUprightCorrection {
+            source: image.clone(),
+            binary: raw_binary.clone(),
+            finders: refined,
+        };
+    }
+
+    let size = image.width().max(image.height()).clamp(1024, 1600);
+    let mut correction = correct_dy_to_upright_with_refined(image, &refined, size);
+    if false && !dy_corrected_has_black_border(&correction.binary, &correction.finders) {
+        let shifted_correction = correct_dy_to_upright_with_refined_and_badge_shift(
+            image,
+            &refined,
+            size,
+            0.0,
+            DY_NO_BORDER_BADGE_SOURCE_Y_SHIFT_SCALE,
+        );
+        if !dy_corrected_has_black_border(&shifted_correction.binary, &shifted_correction.finders)
+            && dy_corrected_no_border_score(&shifted_correction.binary, &shifted_correction.finders)
+                < dy_corrected_no_border_score(&correction.binary, &correction.finders)
+        {
+            correction = shifted_correction;
+        }
+        let weighted_correction = correct_dy_to_upright_with_weighted_badge(
+            image,
+            &refined,
+            size,
+            0.0,
+            DY_NO_BORDER_BADGE_SOURCE_Y_SHIFT_SCALE,
+            DY_NO_BORDER_BADGE_HOMOGRAPHY_WEIGHT,
+        );
+        if !dy_corrected_has_black_border(&weighted_correction.binary, &weighted_correction.finders)
+            && dy_corrected_no_border_score(
+                &weighted_correction.binary,
+                &weighted_correction.finders,
+            ) < dy_corrected_no_border_score(&correction.binary, &correction.finders)
+        {
+            correction = weighted_correction;
+        }
+
+        let dot_refined = [
+            refine_dy_finder_center_from_center_dot(raw_binary, &raw_selected[0]),
+            refine_dy_finder_center_from_center_dot(raw_binary, &raw_selected[1]),
+            refine_dy_finder_center_from_center_dot(raw_binary, &raw_selected[2]),
+        ];
+        let dot_correction = correct_dy_to_upright_with_refined(image, &dot_refined, size);
+        if !dy_corrected_has_black_border(&dot_correction.binary, &dot_correction.finders)
+            && dy_corrected_no_border_score(&dot_correction.binary, &dot_correction.finders)
+                < dy_corrected_no_border_score(&correction.binary, &correction.finders)
+        {
+            correction = dot_correction;
+        }
+        if dy_finder_max_axis_tilt_deg(&dot_refined) <= DY_NO_BORDER_SHIFTED_DOT_MAX_TILT_DEG {
+            let shifted_dot_correction = correct_dy_to_upright_with_refined_and_badge_shift(
+                image,
+                &dot_refined,
+                size,
+                0.0,
+                DY_NO_BORDER_BADGE_SOURCE_Y_SHIFT_SCALE,
+            );
+            if !dy_corrected_has_black_border(
+                &shifted_dot_correction.binary,
+                &shifted_dot_correction.finders,
+            ) && dy_corrected_no_border_score(
+                &shifted_dot_correction.binary,
+                &shifted_dot_correction.finders,
+            ) < dy_corrected_no_border_score(&correction.binary, &correction.finders)
+            {
+                correction = shifted_dot_correction;
+            }
+            let shifted_dot_left_correction = correct_dy_to_upright_with_refined_and_badge_shift(
+                image,
+                &dot_refined,
+                size,
+                DY_NO_BORDER_BADGE_SOURCE_X_SHIFT_SCALE,
+                DY_NO_BORDER_BADGE_SOURCE_Y_SHIFT_SCALE,
+            );
+            if !dy_corrected_has_black_border(
+                &shifted_dot_left_correction.binary,
+                &shifted_dot_left_correction.finders,
+            ) && dy_corrected_no_border_score(
+                &shifted_dot_left_correction.binary,
+                &shifted_dot_left_correction.finders,
+            ) < dy_corrected_no_border_score(&correction.binary, &correction.finders)
+            {
+                correction = shifted_dot_left_correction;
+            }
+            let shifted_dot_small_correction = correct_dy_to_upright_with_refined_and_badge_shift(
+                image,
+                &dot_refined,
+                size,
+                -DY_NO_BORDER_BADGE_SOURCE_SMALL_SHIFT_SCALE,
+                DY_NO_BORDER_BADGE_SOURCE_SMALL_SHIFT_SCALE,
+            );
+            if !dy_corrected_has_black_border(
+                &shifted_dot_small_correction.binary,
+                &shifted_dot_small_correction.finders,
+            ) && dy_corrected_no_border_score(
+                &shifted_dot_small_correction.binary,
+                &shifted_dot_small_correction.finders,
+            ) < dy_corrected_no_border_score(&correction.binary, &correction.finders)
+            {
+                correction = shifted_dot_small_correction;
+            }
+        }
+    }
+
+    let DyUprightCorrection {
+        source,
+        binary,
+        finders,
+    } = correction;
     DyUprightCorrection {
         source,
         binary,
@@ -322,11 +434,431 @@ pub fn correct_dy_to_upright(
     }
 }
 
+fn correct_dy_to_upright_with_refined(
+    image: &DynamicImage,
+    refined: &[DyFinder; 3],
+    size: u32,
+) -> DyUprightCorrection {
+    correct_dy_to_upright_with_refined_and_badge_shift(image, refined, size, 0.0, 0.0)
+}
+
+fn correct_dy_to_upright_with_refined_and_badge_shift(
+    image: &DynamicImage,
+    refined: &[DyFinder; 3],
+    size: u32,
+    badge_x_shift_scale: f64,
+    badge_y_shift_scale: f64,
+) -> DyUprightCorrection {
+    let badge = detect_dy_badge_anchor(image, refined);
+    let top_right = badge.map(|badge| {
+        (
+            badge.cx + badge.radius * badge_x_shift_scale,
+            badge.cy + badge.radius * badge_y_shift_scale.max(0.0),
+        )
+    });
+    let source = if let Some(top_right) = top_right {
+        if let Some(inv) = dy_upright_badge_snap_inverse(refined, top_right, size) {
+            warp_image_with_inverse(image, &inv, size)
+        } else if let Some(inv) = dy_upright_snap_inverse(refined, size) {
+            warp_image_with_inverse(image, &inv, size)
+        } else {
+            warp_dy_to_upright_image_with_top_right(image, refined, Some(top_right), size)
+        }
+    } else if let Some(inv) = dy_upright_snap_inverse(refined, size) {
+        warp_image_with_inverse(image, &inv, size)
+    } else {
+        warp_dy_to_upright_image_with_top_right(image, refined, None, size)
+    };
+    let binary = preprocess(&source);
+    let finders = dy_upright_target_finders(refined, size);
+    DyUprightCorrection {
+        source,
+        binary,
+        finders,
+    }
+}
+
+fn correct_dy_to_upright_with_weighted_badge(
+    image: &DynamicImage,
+    refined: &[DyFinder; 3],
+    size: u32,
+    badge_x_shift_scale: f64,
+    badge_y_shift_scale: f64,
+    badge_weight: f64,
+) -> DyUprightCorrection {
+    let source = detect_dy_badge_anchor(image, refined)
+        .and_then(|badge| {
+            dy_upright_to_source_weighted_badge_homography(
+                refined,
+                (
+                    badge.cx + badge.radius * badge_x_shift_scale,
+                    badge.cy + badge.radius * badge_y_shift_scale.max(0.0),
+                ),
+                size,
+                badge_weight,
+            )
+        })
+        .map(|inv| warp_image_with_inverse(image, &inv, size))
+        .unwrap_or_else(|| correct_dy_to_upright_with_refined(image, refined, size).source);
+    let binary = preprocess(&source);
+    let finders = dy_upright_target_finders(refined, size);
+    DyUprightCorrection {
+        source,
+        binary,
+        finders,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DyScoreGeometry {
+    center: (f64, f64),
+    locator_distance: f64,
+    r_max: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DyScoreRing {
+    r_inner: f64,
+    r_outer: f64,
+    is_decoration: bool,
+}
+
+const DY_NO_BORDER_STANDARD_LOCATOR_DISTANCE: f64 = 240.529442688416;
+const DY_NO_BORDER_STANDARD_SAMPLE_THETA_OFFSET: f64 = -0.5_f64.to_radians();
+const DY_NO_BORDER_BLACK_THRESHOLD: f64 = 0.55;
+const DY_NO_BORDER_DECORATIVE_BLACK_THRESHOLD: f64 = 0.50;
+const DY_NO_BORDER_DECORATIVE_RADIUS_SCORE_WEIGHT: f64 = 0.80;
+const DY_NO_BORDER_RADIUS_SCORE_THRESHOLD: f64 = 0.26;
+const DY_NO_BORDER_RADIUS_SCORE_THETA_OFFSETS: [f64; 3] = [-0.15, 0.0, 0.15];
+const DY_NO_BORDER_RADIUS_SCORE_RADIAL_OFFSETS: [f64; 3] = [-0.20, 0.0, 0.20];
+const DY_NO_BORDER_SCORE_CENTER_REFINE_MAX_RADIUS: f64 = 8.0;
+const DY_NO_BORDER_SCORE_CENTER_REFINE_STEP: f64 = 1.0;
+const DY_NO_BORDER_SCORE_CENTER_OFFSET_WEIGHT: f64 = 0.001;
+const DY_NO_BORDER_BADGE_SOURCE_Y_SHIFT_SCALE: f64 = 0.15;
+const DY_NO_BORDER_BADGE_SOURCE_X_SHIFT_SCALE: f64 = -0.15;
+const DY_NO_BORDER_BADGE_SOURCE_SMALL_SHIFT_SCALE: f64 = 0.12;
+const DY_NO_BORDER_SHIFTED_DOT_MAX_TILT_DEG: f64 = 6.0;
+const DY_NO_BORDER_BADGE_HOMOGRAPHY_WEIGHT: f64 = 0.45;
+const DY_DIRECT_NO_BORDER_CORRECTION_SCORE_MARGIN: f64 = 0.0;
+const DY_NO_BORDER_RINGS: [(f64, f64, bool); 6] = [
+    (228.66, 5.0, true),
+    (207.98, 5.0, false),
+    (188.59, 5.0, true),
+    (171.71, 5.0, false),
+    (153.74, 5.0, false),
+    (133.24, 5.0, false),
+];
+
+fn dy_corrected_has_black_border(bin: &BinaryImage, finders: &[DyFinder; 3]) -> bool {
+    let geometry = dy_score_geometry(finders);
+    let mut score = 0.0_f64;
+    for ratio in [0.88, 0.92, 0.96, 1.0] {
+        score = score.max(dy_radial_black_score(
+            bin,
+            geometry.center,
+            geometry.r_max * ratio,
+        ));
+    }
+    let outside_score = dy_radial_black_score(bin, geometry.center, geometry.r_max * 1.06);
+    score > 0.30 && outside_score < 0.45
+}
+
+fn dy_corrected_no_border_score(bin: &BinaryImage, finders: &[DyFinder; 3]) -> f64 {
+    let theta_offset = dy_no_border_score_theta_offset(finders);
+    let base_geometry = dy_score_geometry(finders);
+    let mut best = f64::INFINITY;
+    let steps = (DY_NO_BORDER_SCORE_CENTER_REFINE_MAX_RADIUS
+        / DY_NO_BORDER_SCORE_CENTER_REFINE_STEP)
+        .ceil() as i32;
+
+    for dy_step in -steps..=steps {
+        for dx_step in -steps..=steps {
+            let dx = f64::from(dx_step) * DY_NO_BORDER_SCORE_CENTER_REFINE_STEP;
+            let dy = f64::from(dy_step) * DY_NO_BORDER_SCORE_CENTER_REFINE_STEP;
+            let offset2 = dx * dx + dy * dy;
+            if offset2
+                > DY_NO_BORDER_SCORE_CENTER_REFINE_MAX_RADIUS
+                    * DY_NO_BORDER_SCORE_CENTER_REFINE_MAX_RADIUS
+            {
+                continue;
+            }
+            let geometry = dy_score_geometry_with_center_offset(&base_geometry, finders, dx, dy);
+            let rings = dy_no_border_score_rings(&geometry);
+            let code_rings = rings
+                .iter()
+                .copied()
+                .filter(|ring| !ring.is_decoration)
+                .collect::<Vec<_>>();
+            let decorative_rings = rings
+                .iter()
+                .copied()
+                .filter(|ring| ring.is_decoration)
+                .collect::<Vec<_>>();
+            let score =
+                dy_candidate_no_border_grid_score(bin, &geometry, &code_rings, 120, theta_offset)
+                    + dy_candidate_no_border_grid_score(
+                        bin,
+                        &geometry,
+                        &decorative_rings,
+                        120,
+                        theta_offset,
+                    ) * DY_NO_BORDER_DECORATIVE_RADIUS_SCORE_WEIGHT
+                    + offset2 * DY_NO_BORDER_SCORE_CENTER_OFFSET_WEIGHT;
+            best = best.min(score);
+        }
+    }
+
+    best
+}
+
+fn dy_score_geometry(finders: &[DyFinder; 3]) -> DyScoreGeometry {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let br = &ordered[2];
+    let center = ((tl.cx + br.cx) * 0.5, (tl.cy + br.cy) * 0.5);
+    let locator_radius = finders.iter().map(DyFinder::outer_radius).sum::<f64>() / 3.0;
+    let locator_distance = finders
+        .iter()
+        .map(|finder| dy_point_distance(center, (finder.cx, finder.cy)))
+        .sum::<f64>()
+        / finders.len() as f64;
+    let r_max = finders
+        .iter()
+        .map(|finder| {
+            dy_point_distance(center, (finder.cx, finder.cy)) + finder.outer_radius() * 1.10
+        })
+        .fold(0.0, f64::max)
+        .max(locator_radius * 5.0);
+
+    DyScoreGeometry {
+        center,
+        locator_distance,
+        r_max,
+    }
+}
+
+fn dy_score_geometry_with_center_offset(
+    base_geometry: &DyScoreGeometry,
+    finders: &[DyFinder; 3],
+    dx: f64,
+    dy: f64,
+) -> DyScoreGeometry {
+    let center = (base_geometry.center.0 + dx, base_geometry.center.1 + dy);
+    let locator_radius = finders.iter().map(DyFinder::outer_radius).sum::<f64>() / 3.0;
+    let locator_distance = finders
+        .iter()
+        .map(|finder| dy_point_distance(center, (finder.cx, finder.cy)))
+        .sum::<f64>()
+        / finders.len() as f64;
+    let r_max = finders
+        .iter()
+        .map(|finder| {
+            dy_point_distance(center, (finder.cx, finder.cy)) + finder.outer_radius() * 1.10
+        })
+        .fold(0.0, f64::max)
+        .max(locator_radius * 5.0);
+
+    DyScoreGeometry {
+        center,
+        locator_distance,
+        r_max,
+    }
+}
+
+fn dy_no_border_score_rings(geometry: &DyScoreGeometry) -> Vec<DyScoreRing> {
+    let scale = (geometry.locator_distance / DY_NO_BORDER_STANDARD_LOCATOR_DISTANCE).max(0.01);
+    DY_NO_BORDER_RINGS
+        .iter()
+        .map(|&(radius, half_width, is_decoration)| DyScoreRing {
+            r_inner: (radius - half_width) * scale,
+            r_outer: (radius + half_width) * scale,
+            is_decoration,
+        })
+        .collect()
+}
+
+fn dy_no_border_score_theta_offset(finders: &[DyFinder; 3]) -> f64 {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let br = &ordered[2];
+    let diagonal_angle = (br.cy - tl.cy).atan2(br.cx - tl.cx);
+    let rotation = diagonal_angle - std::f64::consts::FRAC_PI_4;
+
+    (DY_NO_BORDER_STANDARD_SAMPLE_THETA_OFFSET + rotation).rem_euclid(std::f64::consts::TAU)
+}
+
+fn dy_candidate_no_border_grid_score(
+    bin: &BinaryImage,
+    geometry: &DyScoreGeometry,
+    rings: &[DyScoreRing],
+    points_per_ring: u32,
+    theta_offset: f64,
+) -> f64 {
+    let mut uncertainty = 0.0;
+    let mut score_black = 0_u32;
+    let mut score_total = 0_u32;
+    let mut ring_density_penalty = 0.0;
+    let mut scored_rings = 0_u32;
+
+    for ring in rings {
+        let final_threshold = if ring.is_decoration {
+            DY_NO_BORDER_DECORATIVE_BLACK_THRESHOLD
+        } else {
+            DY_NO_BORDER_BLACK_THRESHOLD
+        };
+        let min_density = if ring.is_decoration { 0.18 } else { 0.40 };
+        let mut ring_black = 0_u32;
+        let mut ring_total = 0_u32;
+
+        for point in 0..points_per_ring {
+            let ratio = dy_sample_cell_black_ratio_with_offsets(
+                bin,
+                geometry,
+                ring,
+                points_per_ring,
+                theta_offset,
+                point,
+                (
+                    &DY_NO_BORDER_RADIUS_SCORE_THETA_OFFSETS,
+                    &DY_NO_BORDER_RADIUS_SCORE_RADIAL_OFFSETS,
+                ),
+            );
+            uncertainty += ratio.min(1.0 - ratio);
+            if ratio >= DY_NO_BORDER_RADIUS_SCORE_THRESHOLD {
+                score_black += 1;
+            }
+            if ratio >= final_threshold {
+                ring_black += 1;
+            }
+            score_total += 1;
+            ring_total += 1;
+        }
+
+        if ring_total != 0 {
+            let density = f64::from(ring_black) / f64::from(ring_total);
+            if density < min_density {
+                ring_density_penalty += min_density - density;
+            }
+            scored_rings += 1;
+        }
+    }
+
+    if score_total == 0 {
+        return f64::INFINITY;
+    }
+
+    let black_ratio = f64::from(score_black) / f64::from(score_total);
+    let density_penalty = if (0.08..=0.62).contains(&black_ratio) {
+        0.0
+    } else {
+        (black_ratio - 0.35).abs()
+    };
+    let ring_density_penalty = if scored_rings == 0 {
+        0.0
+    } else {
+        ring_density_penalty / f64::from(scored_rings)
+    };
+
+    uncertainty / f64::from(score_total) + density_penalty + ring_density_penalty
+}
+
+fn dy_sample_cell_black_ratio_with_offsets(
+    bin: &BinaryImage,
+    geometry: &DyScoreGeometry,
+    ring: &DyScoreRing,
+    points_per_ring: u32,
+    theta_offset: f64,
+    point: u32,
+    offsets: (&[f64], &[f64]),
+) -> f64 {
+    let theta_step = std::f64::consts::TAU / points_per_ring as f64;
+    let radial_step = ring.r_outer - ring.r_inner;
+    let theta = theta_offset + (point as f64 + 0.5) * theta_step;
+    let radius = (ring.r_inner + ring.r_outer) * 0.5;
+    let mut black = 0;
+    let mut total = 0;
+
+    for &theta_delta in offsets.0 {
+        for &radial_delta in offsets.1 {
+            let sample_theta = theta + theta_delta * theta_step;
+            let sample_radius = radius + radial_delta * radial_step;
+            if dy_sample_polar(bin, geometry.center, sample_radius, sample_theta) {
+                black += 1;
+            }
+            total += 1;
+        }
+    }
+
+    black as f64 / total as f64
+}
+
+fn dy_sample_polar(bin: &BinaryImage, center: (f64, f64), radius: f64, theta: f64) -> bool {
+    let x = (center.0 + radius * theta.cos()).round() as i32;
+    let y = (center.1 + radius * theta.sin()).round() as i32;
+    bin.is_black(x, y)
+}
+
+fn dy_radial_black_score(bin: &BinaryImage, center: (f64, f64), radius: f64) -> f64 {
+    const SAMPLES: u32 = 144;
+    let mut black = 0;
+    let mut total = 0;
+    for idx in 0..SAMPLES {
+        let theta = f64::from(idx) * std::f64::consts::TAU / f64::from(SAMPLES);
+        let x = (center.0 + radius * theta.cos()).round() as i32;
+        let y = (center.1 + radius * theta.sin()).round() as i32;
+        if x < 0 || y < 0 || x >= bin.w as i32 || y >= bin.h as i32 {
+            continue;
+        }
+        total += 1;
+        if bin.is_black(x, y) {
+            black += 1;
+        }
+    }
+
+    f64::from(black) / f64::from(total.max(1))
+}
+
 /// 判定为"本来就是正立图"的最大腿倾角。定位点检测误差通常表现为
 /// 1 度以内的伪倾斜；真实拍摄倾斜一般明显大于该值。
 const DY_UPRIGHT_SNAP_MAX_TILT_DEG: f64 = 1.5;
+const DY_STANDARD_DIRECT_MAX_LEG_DELTA_RATIO: f64 = 0.035;
+const DY_DIRECT_NO_BORDER_CORRECTION_MAX_DIM: u32 = 500;
+
+fn dy_direct_no_border_correction_candidate_allowed(image: &DynamicImage) -> bool {
+    image.width() != image.height()
+        && image.width().max(image.height()) <= DY_DIRECT_NO_BORDER_CORRECTION_MAX_DIM
+}
+
+fn is_standard_dy_upright_input(finders: &[DyFinder; 3]) -> bool {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let bl = &ordered[1];
+    let br = &ordered[2];
+    let bottom_tilt = (br.cy - bl.cy).atan2(br.cx - bl.cx);
+    let left_tilt = (bl.cx - tl.cx).atan2(bl.cy - tl.cy);
+    let max_tilt = DY_UPRIGHT_SNAP_MAX_TILT_DEG.to_radians();
+    if bottom_tilt.abs() > max_tilt || left_tilt.abs() > max_tilt {
+        return false;
+    }
+
+    let left_leg = dy_distance(tl, bl);
+    let bottom_leg = dy_distance(bl, br);
+    let average_leg = ((left_leg + bottom_leg) * 0.5).max(1.0);
+    (left_leg - bottom_leg).abs() / average_leg <= DY_STANDARD_DIRECT_MAX_LEG_DELTA_RATIO
+}
 
 /// 正立吸附：三点最小二乘的无旋转相似变换（目标像素 → 源像素）。
+fn dy_finder_max_axis_tilt_deg(finders: &[DyFinder; 3]) -> f64 {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let bl = &ordered[1];
+    let br = &ordered[2];
+    let bottom_tilt = (br.cy - bl.cy).atan2(br.cx - bl.cx).abs();
+    let left_tilt = (bl.cx - tl.cx).atan2(bl.cy - tl.cy).abs();
+
+    bottom_tilt.max(left_tilt).to_degrees()
+}
+
 fn dy_upright_snap_inverse(finders: &[DyFinder; 3], target_size: u32) -> Option<Matrix3<f64>> {
     let ordered = order_dy_finders(finders);
     let tl = &ordered[0];
@@ -531,6 +1063,118 @@ pub fn detect_dy_badge_anchor(
     }
 
     best.map(|(_, anchor)| anchor)
+        .or_else(|| scan_dy_badge_anchor(&rgba, expected, locator_radius, locator_distance))
+}
+
+fn scan_dy_badge_anchor(
+    image: &RgbaImage,
+    expected: (f64, f64),
+    locator_radius: f64,
+    locator_distance: f64,
+) -> Option<DyBadgeAnchor> {
+    let search_radius = (locator_distance * 0.20).max(locator_radius * 1.5);
+    let radius_min = (locator_radius * 1.5).max(8.0);
+    let radius_max = (locator_radius * 3.2).max(radius_min + 1.0);
+    let step = (locator_radius * 0.18).round().max(2.0) as i32;
+    let radius_step = (locator_radius * 0.12).round().max(1.0);
+    let mut best: Option<(f64, DyBadgeAnchor)> = None;
+
+    let x0 = (expected.0 - search_radius).floor() as i32;
+    let x1 = (expected.0 + search_radius).ceil() as i32;
+    let y0 = (expected.1 - search_radius).floor() as i32;
+    let y1 = (expected.1 + search_radius).ceil() as i32;
+    let mut y = y0;
+    while y <= y1 {
+        let mut x = x0;
+        while x <= x1 {
+            let distance_to_expected = dy_point_distance((x as f64, y as f64), expected);
+            if distance_to_expected <= search_radius {
+                let mut radius = radius_min;
+                while radius <= radius_max {
+                    let score = dy_badge_template_score(image, x as f64, y as f64, radius)
+                        - distance_to_expected / locator_distance.max(1.0) * 0.35;
+                    if score > 1.55
+                        && best
+                            .as_ref()
+                            .is_none_or(|(best_score, _)| score > *best_score)
+                    {
+                        best = Some((
+                            score,
+                            DyBadgeAnchor {
+                                cx: x as f64,
+                                cy: y as f64,
+                                radius,
+                            },
+                        ));
+                    }
+                    radius += radius_step;
+                }
+            }
+            x += step;
+        }
+        y += step;
+    }
+
+    best.map(|(_, anchor)| anchor)
+}
+
+fn dy_badge_template_score(image: &RgbaImage, cx: f64, cy: f64, radius: f64) -> f64 {
+    let ring = dy_badge_ring_dark_ratio(image, cx, cy, radius * 0.92);
+    let inner_light = 1.0 - dy_badge_disk_dark_ratio(image, cx, cy, radius * 0.62);
+    let outside_light = 1.0 - dy_badge_ring_dark_ratio(image, cx, cy, radius * 1.18);
+
+    if ring < 0.42 || inner_light < 0.45 || outside_light < 0.45 {
+        return 0.0;
+    }
+
+    ring * 1.6 + inner_light * 0.8 + outside_light * 0.5
+}
+
+fn dy_badge_ring_dark_ratio(image: &RgbaImage, cx: f64, cy: f64, radius: f64) -> f64 {
+    const SAMPLES: u32 = 96;
+    let mut dark = 0_u32;
+    let mut total = 0_u32;
+
+    for idx in 0..SAMPLES {
+        let theta = idx as f64 * std::f64::consts::TAU / SAMPLES as f64;
+        let x = (cx + radius * theta.cos()).round() as i32;
+        let y = (cy + radius * theta.sin()).round() as i32;
+        if x < 0 || y < 0 || x >= image.width() as i32 || y >= image.height() as i32 {
+            continue;
+        }
+        total += 1;
+        if dy_badge_dark_pixel(image.get_pixel(x as u32, y as u32).0) {
+            dark += 1;
+        }
+    }
+
+    f64::from(dark) / f64::from(total.max(1))
+}
+
+fn dy_badge_disk_dark_ratio(image: &RgbaImage, cx: f64, cy: f64, radius: f64) -> f64 {
+    let min_x = (cx - radius).floor().max(0.0) as i32;
+    let max_x = (cx + radius).ceil().min(image.width() as f64 - 1.0) as i32;
+    let min_y = (cy - radius).floor().max(0.0) as i32;
+    let max_y = (cy + radius).ceil().min(image.height() as f64 - 1.0) as i32;
+    let radius2 = radius * radius;
+    let mut dark = 0_u32;
+    let mut total = 0_u32;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f64 + 0.5 - cx;
+            let dy = y as f64 + 0.5 - cy;
+            if dx * dx + dy * dy > radius2 {
+                continue;
+            }
+            total += 1;
+            if dy_badge_dark_pixel(image.get_pixel(x as u32, y as u32).0) {
+                dark += 1;
+            }
+        }
+    }
+
+    f64::from(dark) / f64::from(total.max(1))
 }
 
 pub fn dy_upright_target_finders(finders: &[DyFinder; 3], target_size: u32) -> [DyFinder; 3] {
@@ -931,6 +1575,31 @@ fn dy_upright_to_source_homography_with_badge_offset(
     let dst = [(margin, margin), tr_dst, (margin, far), (far, far)];
 
     homography_from_4pts(&src, &dst).try_inverse()
+}
+
+fn dy_upright_to_source_weighted_badge_homography(
+    finders: &[DyFinder; 3],
+    top_right: (f64, f64),
+    target_size: u32,
+    badge_weight: f64,
+) -> Option<Matrix3<f64>> {
+    let ordered = order_dy_finders(finders);
+    let tl = &ordered[0];
+    let bl = &ordered[1];
+    let br = &ordered[2];
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let target_leg = far - margin;
+    let target_badge = (
+        far + DY_BADGE_CENTER_DX_PER_LOCATOR_LEG * target_leg,
+        margin + DY_BADGE_CENTER_DY_PER_LOCATOR_LEG * target_leg,
+    );
+    let src = vec![(tl.cx, tl.cy), top_right, (bl.cx, bl.cy), (br.cx, br.cy)];
+    let dst = vec![(margin, margin), target_badge, (margin, far), (far, far)];
+    let weights = vec![1.0, badge_weight.clamp(0.05, 1.0), 1.0, 1.0];
+
+    homography_from_points(&src, &dst, &weights)?.try_inverse()
 }
 
 fn order_dy_finders(finders: &[DyFinder; 3]) -> [DyFinder; 3] {
