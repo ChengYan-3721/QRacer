@@ -7,29 +7,35 @@
 //   - 状态变化（粘贴图、选文件）只改 self 的字段，下一帧 UI 自动跟着变
 
 use crate::code_kind::CodeKind;
+use crate::codec::data_matrix_grid::{
+    DataMatrixGrid, sample_data_matrix_grid, sample_data_matrix_grid_for_symbol,
+};
 use crate::codec::dy_grid::{DyGrid, detect_dy_params, sample_dy, sample_dy_with_logos};
 use crate::codec::qr::{QrDecoded, QrEcc, QrMatrix, decode_qr, regenerate_qr};
 use crate::codec::qr_grid::{infer_qr_version, sample_qr_grid};
 use crate::codec::wx_grid::{WxGrid, detect_wx_version, sample_wx, sample_wx_with_badge};
 use crate::detect;
-use crate::detect::finder_dy::{find_dy_finders, select_dy_finders_raw};
+use crate::detect::finder_dm::{DataMatrixCandidate, find_data_matrix_candidates};
+use crate::detect::finder_dy::{DyFinder, find_dy_finders, select_dy_finders_raw};
 use crate::detect::finder_qr::{QrFinder, find_qr_finders, select_qr_finder_triplet};
 use crate::detect::finder_wx::{
-    find_wx_finders, select_wx_finders_raw, select_wx_finders_raw_with_badge,
+    WxFinder, find_wx_finders, select_wx_finders_raw, select_wx_finders_raw_with_badge,
 };
 use crate::image_io;
 use crate::pipeline::perspective::{
     WxUprightAnchor, correct_dy_to_upright, detect_wx_badge_anchor, dy_upright_target_finders,
-    warp_dy_to_upright_binary, warp_qr_to_square_image, warp_wx_to_upright_binary,
-    warp_wx_to_upright_image, wx_upright_target_finders,
+    warp_corners_to_image, warp_dy_to_upright_binary, warp_image_corners_to_square,
+    warp_qr_to_square_image, warp_wx_to_upright_binary, warp_wx_to_upright_image,
+    wx_upright_target_finders,
 };
 use crate::pipeline::preprocess::{BinaryImage, preprocess};
 use crate::screen_capture;
 use crate::ui;
 use crate::vector::diff::{DiffResult, compute_matrix_diff};
 use crate::vector::svg::{
-    QrAppearance, dy_grid_to_diff_preview_image, dy_grid_to_preview_image, dy_grid_to_svg,
-    qr_matrix_to_preview_image, qr_matrix_to_svg, qr_matrix_to_svg_with_appearance,
+    QrAppearance, data_matrix_grid_to_diff_preview_image, data_matrix_grid_to_preview_image,
+    data_matrix_grid_to_svg, dy_grid_to_diff_preview_image, dy_grid_to_preview_image,
+    dy_grid_to_svg, qr_matrix_to_preview_image, qr_matrix_to_svg, qr_matrix_to_svg_with_appearance,
     wx_grid_to_diff_preview_image, wx_grid_to_preview_image, wx_grid_to_svg,
 };
 use eframe::egui;
@@ -50,6 +56,10 @@ const QR_LOGO_IGNORE_RATIO: usize = 3;
 const QR_LOGO_IGNORE_MIN_MODULES: usize = 9;
 const LOADING_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 const SCREEN_CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(180);
+const DY_MANUAL_NO_BORDER_LOCATOR_DISTANCE: f64 = 240.529442688416;
+const DY_MANUAL_NO_BORDER_LOCATOR_RADII: [f64; 3] = [8.13, 18.43, 29.01];
+const DY_MANUAL_BLACK_BORDER_LOCATOR_DISTANCE: f64 = 261.452;
+const DY_MANUAL_BLACK_BORDER_LOCATOR_RADII: [f64; 3] = [8.05, 18.24, 28.71];
 
 /// 一张加载好的图像 + 上传到 GPU 的纹理句柄。
 ///
@@ -94,6 +104,8 @@ pub struct QRacerApp {
     pub preview: Option<LoadedImage>,
     /// 当前识别到的码类型（阶段 1 始终 Unknown）
     pub code_kind: CodeKind,
+    /// 手动指定码类型；None 表示继续使用自动识别结果。
+    pub code_kind_override: Option<CodeKind>,
     /// 给用户看的状态文字
     pub status: String,
     /// Stage 2 binary preprocessing result.
@@ -116,6 +128,8 @@ pub struct QRacerApp {
     pub qr_reference_matrix: Option<QrMatrix>,
     /// QR mask that matches outside the center logo area.
     pub matched_mask: Option<u8>,
+    /// Last sampled Data Matrix grid.
+    pub last_data_matrix_grid: Option<DataMatrixGrid>,
     /// Stage 5 last sampled mini-program radial grid.
     pub last_wx_grid: Option<WxGrid>,
     /// Stage 6 last sampled Douyin radial grid.
@@ -130,6 +144,7 @@ pub struct QRacerApp {
     processing_job: Option<ProcessingJob>,
     capture_job: Option<CaptureJob>,
     support_dialog: ui::support_dialog::SupportDialog,
+    pub manual_calibration: ui::manual_calibration::ManualCalibrationState,
     next_job_id: u64,
 }
 
@@ -162,6 +177,7 @@ struct ProcessResult {
     last_matrix: Option<QrMatrix>,
     qr_reference_matrix: Option<QrMatrix>,
     matched_mask: Option<u8>,
+    last_data_matrix_grid: Option<DataMatrixGrid>,
     last_wx_grid: Option<WxGrid>,
     last_dy_grid: Option<DyGrid>,
     last_svg: Option<String>,
@@ -177,6 +193,7 @@ impl QRacerApp {
             original: None,
             preview: None,
             code_kind: CodeKind::Unknown,
+            code_kind_override: None,
             status: String::from("粘贴截图（Ctrl+V）或点击 [打开...] 开始"),
             binary: None,
             finders: None,
@@ -188,6 +205,7 @@ impl QRacerApp {
             last_matrix: None,
             qr_reference_matrix: None,
             matched_mask: None,
+            last_data_matrix_grid: None,
             last_wx_grid: None,
             last_dy_grid: None,
             last_svg: None,
@@ -197,12 +215,110 @@ impl QRacerApp {
             processing_job: None,
             capture_job: None,
             support_dialog: ui::support_dialog::SupportDialog::new(),
+            manual_calibration: ui::manual_calibration::ManualCalibrationState::new(),
             next_job_id: 0,
         }
     }
 
     pub fn open_support(&mut self) {
         self.support_dialog.open();
+    }
+
+    pub fn current_forced_or_detected_kind(&self) -> Option<CodeKind> {
+        self.code_kind_override
+            .or_else(|| self.code_kind.can_process().then_some(self.code_kind))
+    }
+
+    pub fn set_code_kind_override(&mut self, kind: Option<CodeKind>) {
+        let kind = kind.filter(|kind| kind.can_process());
+        if self.code_kind_override == kind {
+            return;
+        }
+
+        self.code_kind_override = kind;
+        if let Some(kind) = kind {
+            self.code_kind = kind;
+            if kind.can_manual_calibrate() {
+                self.manual_calibration.set_kind(kind);
+            }
+        }
+
+        if self.manual_calibration.open {
+            return;
+        }
+
+        let Some(source) = self.original.as_ref().map(|loaded| loaded.source.clone()) else {
+            self.status = match kind {
+                Some(kind) => format!("已选择码类型：{}", kind.label()),
+                None => String::from("已切回自动识别"),
+            };
+            return;
+        };
+        let label = if kind.is_some() {
+            "图像（手动码类型）"
+        } else {
+            "图像（自动识别）"
+        };
+        self.begin_processing(source, label);
+    }
+
+    pub fn open_manual_calibration(&mut self) {
+        let Some(original) = self.original.as_ref() else {
+            self.status = String::from("没有可用于手动校准的原图");
+            return;
+        };
+
+        let kind = self
+            .current_forced_or_detected_kind()
+            .filter(|kind| kind.can_manual_calibrate())
+            .unwrap_or(CodeKind::Douyin);
+        self.manual_calibration
+            .open_for(kind, (original.source.width(), original.source.height()));
+    }
+
+    pub fn apply_manual_calibration(&mut self) {
+        let kind = self.manual_calibration.kind;
+        if !kind.can_manual_calibrate() {
+            self.status = String::from("当前码类型不需要手动校准");
+            return;
+        }
+
+        let Some(source) = self.original.as_ref().map(|loaded| loaded.source.clone()) else {
+            self.status = String::from("没有可用于手动校准的原图");
+            return;
+        };
+
+        let target_size = source
+            .width()
+            .max(source.height())
+            .clamp(PREVIEW_SIZE, 1600);
+        let destination_corners = self.manual_calibration.output_corners(target_size);
+        let corrected_source =
+            warp_image_corners_to_square(&source, &destination_corners, target_size);
+        let dy_border_hint = self
+            .last_dy_grid
+            .as_ref()
+            .is_some_and(|grid| grid.has_border);
+
+        self.processing_job = None;
+        self.code_kind_override = Some(kind);
+        self.code_kind = kind;
+        self.clear_recognition_artifacts();
+
+        let result = match kind {
+            CodeKind::WxMiniprogram => self.process_manual_wx(corrected_source),
+            CodeKind::Douyin => self.process_manual_dy(corrected_source, dy_border_hint),
+            _ => Err(String::from("当前码类型不需要手动校准")),
+        };
+
+        match result {
+            Ok(()) => {
+                self.manual_calibration.open = false;
+            }
+            Err(error) => {
+                self.status = error;
+            }
+        }
     }
 
     /// 把图像装载为原图，并把识别/校正/矢量化放到后台线程。
@@ -214,8 +330,10 @@ impl QRacerApp {
         self.next_job_id = self.next_job_id.wrapping_add(1);
         let job_id = self.next_job_id;
         let show_diff_overlay = self.show_diff_overlay;
+        let code_kind_override = self.code_kind_override;
 
         self.processing_job = None;
+        self.manual_calibration.close_for_new_image();
         self.original = Some(LoadedImage::from_dynamic(
             format!("original-{job_id}"),
             img.clone(),
@@ -232,6 +350,7 @@ impl QRacerApp {
         self.last_matrix = None;
         self.qr_reference_matrix = None;
         self.matched_mask = None;
+        self.last_data_matrix_grid = None;
         self.last_wx_grid = None;
         self.last_dy_grid = None;
         self.last_svg = None;
@@ -240,7 +359,7 @@ impl QRacerApp {
 
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = process_image(img, job_id, show_diff_overlay);
+            let result = process_image(img, job_id, show_diff_overlay, code_kind_override);
             let _ = sender.send(result);
         });
         self.processing_job = Some(ProcessingJob {
@@ -401,6 +520,7 @@ impl QRacerApp {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resample_wx(&mut self) {
         if self.code_kind != CodeKind::WxMiniprogram {
             self.status = String::from("当前图像不是小程序码");
@@ -416,6 +536,7 @@ impl QRacerApp {
         self.process_wx(&binary, source.as_ref());
     }
 
+    #[allow(dead_code)]
     pub fn resample_dy(&mut self) {
         if self.code_kind != CodeKind::Douyin {
             self.status = String::from("当前图像不是抖音码");
@@ -439,6 +560,8 @@ impl QRacerApp {
 
         if self.last_matrix.is_some() {
             self.refresh_generated_preview();
+        } else if self.last_data_matrix_grid.is_some() {
+            self.refresh_data_matrix_preview();
         } else if self.last_wx_grid.is_some() {
             self.refresh_wx_preview();
         } else if self.last_dy_grid.is_some() {
@@ -496,6 +619,94 @@ impl QRacerApp {
         }
     }
 
+    fn clear_recognition_artifacts(&mut self) {
+        self.preview = None;
+        self.binary = None;
+        self.finders = None;
+        self.warped = None;
+        self.mask_choice = MaskChoice::Mask(0);
+        self.qr_appearance = QrAppearance::Standard;
+        self.last_decoded = None;
+        self.qr_version = None;
+        self.last_matrix = None;
+        self.qr_reference_matrix = None;
+        self.matched_mask = None;
+        self.last_data_matrix_grid = None;
+        self.last_wx_grid = None;
+        self.last_dy_grid = None;
+        self.last_svg = None;
+        self.last_diff_count = None;
+    }
+
+    fn process_manual_wx(
+        &mut self,
+        corrected_source: DynamicImage,
+    ) -> std::result::Result<(), String> {
+        let corrected_binary = preprocess(&corrected_source);
+        let selected = manual_wx_target_finders(corrected_binary.w);
+        self.binary = Some(corrected_binary.clone());
+        self.warped = Some(corrected_binary.clone());
+
+        let preferred_version = detect_wx_version(&corrected_binary, &selected).ok();
+        let mut best: Option<(u32, bool, WxGrid)> = None;
+        let mut errors = Vec::new();
+        for version in [36, 54, 72] {
+            let grid = match sample_wx_with_badge(
+                &corrected_binary,
+                &corrected_source,
+                &selected,
+                version,
+            ) {
+                Ok(grid) => grid,
+                Err(error) => {
+                    errors.push(format!("{version} 线：{error}"));
+                    continue;
+                }
+            };
+            let (_, diff_count) =
+                wx_grid_to_diff_preview_image(&grid, &corrected_binary, false, PREVIEW_SIZE);
+            let preferred = preferred_version == Some(version);
+            if best.as_ref().is_none_or(|(best_diff, best_preferred, _)| {
+                diff_count < *best_diff
+                    || (diff_count == *best_diff && preferred && !*best_preferred)
+            }) {
+                best = Some((diff_count, preferred, grid));
+            }
+        }
+
+        let Some((_, _, grid)) = best else {
+            return Err(if errors.is_empty() {
+                String::from("手动校准小程序码失败：无可用候选")
+            } else {
+                format!("手动校准小程序码失败：{}", errors.join("；"))
+            });
+        };
+
+        let svg = wx_grid_to_svg(&grid);
+        self.set_wx_artifacts(grid, svg);
+        Ok(())
+    }
+
+    fn process_manual_dy(
+        &mut self,
+        corrected_source: DynamicImage,
+        border_hint: bool,
+    ) -> std::result::Result<(), String> {
+        let corrected_binary = preprocess(&corrected_source);
+        let selected = manual_dy_target_finders(corrected_binary.w, border_hint);
+        self.binary = Some(corrected_binary.clone());
+        self.warped = Some(corrected_binary.clone());
+
+        let params = detect_dy_params(&corrected_binary, &selected)
+            .map_err(|error| format!("手动校准抖音码参数检测失败：{error}"))?;
+        let grid = sample_dy_with_logos(&corrected_binary, &corrected_source, &selected, params)
+            .map_err(|error| format!("手动校准抖音码环形采样失败：{error}"))?;
+        let svg = dy_grid_to_svg(&grid);
+        self.set_dy_artifacts(grid, svg);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn process_wx(&mut self, binary: &BinaryImage, source: Option<&DynamicImage>) {
         let finders = find_wx_finders(binary);
         let badge_anchor = source.and_then(detect_wx_badge_anchor);
@@ -567,6 +778,7 @@ impl QRacerApp {
         }
     }
 
+    #[allow(dead_code)]
     fn process_dy(&mut self, binary: &BinaryImage, source: Option<&DynamicImage>) {
         let finders = find_dy_finders(binary);
         let Some(raw_selected) = select_dy_finders_raw(&finders) else {
@@ -665,6 +877,7 @@ impl QRacerApp {
     }
 
     fn set_generated_artifacts(&mut self, matrix: QrMatrix, svg: String) {
+        self.last_data_matrix_grid = None;
         self.last_wx_grid = None;
         self.last_dy_grid = None;
         self.last_matrix = Some(matrix);
@@ -676,6 +889,7 @@ impl QRacerApp {
         self.last_matrix = None;
         self.qr_reference_matrix = None;
         self.matched_mask = None;
+        self.last_data_matrix_grid = None;
         self.last_dy_grid = None;
         self.last_wx_grid = Some(grid);
         self.last_svg = Some(svg);
@@ -686,10 +900,40 @@ impl QRacerApp {
         self.last_matrix = None;
         self.qr_reference_matrix = None;
         self.matched_mask = None;
+        self.last_data_matrix_grid = None;
         self.last_wx_grid = None;
         self.last_dy_grid = Some(grid);
         self.last_svg = Some(svg);
         self.refresh_dy_preview();
+    }
+
+    fn refresh_data_matrix_preview(&mut self) {
+        let Some(grid) = self.last_data_matrix_grid.as_ref() else {
+            return;
+        };
+
+        let diff_source = self.warped.as_ref().or(self.binary.as_ref());
+        let (preview, diff_count) = match diff_source {
+            Some(binary) => data_matrix_grid_to_diff_preview_image(
+                grid,
+                binary,
+                self.show_diff_overlay,
+                PREVIEW_SIZE,
+            ),
+            None => (data_matrix_grid_to_preview_image(grid, PREVIEW_SIZE), 0),
+        };
+        self.preview = Some(LoadedImage::from_dynamic(
+            format!(
+                "preview-data-matrix-{}x{}-{}",
+                grid.cols, grid.rows, self.show_diff_overlay
+            ),
+            preview,
+        ));
+        self.last_diff_count = Some(diff_count);
+        self.status = format!(
+            "已识别 Data Matrix：{} x {} 模块；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+            grid.cols, grid.rows
+        );
     }
 
     fn refresh_wx_preview(&mut self) {
@@ -872,6 +1116,7 @@ impl QRacerApp {
         self.last_matrix = result.last_matrix;
         self.qr_reference_matrix = result.qr_reference_matrix;
         self.matched_mask = result.matched_mask;
+        self.last_data_matrix_grid = result.last_data_matrix_grid;
         self.last_wx_grid = result.last_wx_grid;
         self.last_dy_grid = result.last_dy_grid;
         self.last_svg = result.last_svg;
@@ -881,6 +1126,73 @@ impl QRacerApp {
             .map(|(name, image)| LoadedImage::from_dynamic(name, image));
         self.status = result.status;
     }
+}
+
+fn manual_wx_target_finders(target_size: u32) -> [WxFinder; 3] {
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let target_leg = far - margin;
+    let radius = (target_leg * 0.0786).max(1.0);
+
+    [
+        WxFinder {
+            cx: margin,
+            cy: margin,
+            r_outer: radius,
+        },
+        WxFinder {
+            cx: far,
+            cy: margin,
+            r_outer: radius,
+        },
+        WxFinder {
+            cx: margin,
+            cy: far,
+            r_outer: radius,
+        },
+    ]
+}
+
+fn manual_dy_target_finders(target_size: u32, has_border_hint: bool) -> [DyFinder; 3] {
+    let max = target_size.saturating_sub(1) as f64;
+    let margin = max * 0.23;
+    let far = max - margin;
+    let locator_distance = (far - margin) / std::f64::consts::SQRT_2;
+    let (standard_distance, standard_radii) = if has_border_hint {
+        (
+            DY_MANUAL_BLACK_BORDER_LOCATOR_DISTANCE,
+            DY_MANUAL_BLACK_BORDER_LOCATOR_RADII,
+        )
+    } else {
+        (
+            DY_MANUAL_NO_BORDER_LOCATOR_DISTANCE,
+            DY_MANUAL_NO_BORDER_LOCATOR_RADII,
+        )
+    };
+    let scale = (locator_distance / standard_distance).max(0.01);
+    let rings = standard_radii
+        .iter()
+        .map(|radius| (radius * scale).max(1.0))
+        .collect::<Vec<_>>();
+
+    [
+        DyFinder {
+            cx: margin,
+            cy: margin,
+            rings: rings.clone(),
+        },
+        DyFinder {
+            cx: margin,
+            cy: far,
+            rings: rings.clone(),
+        },
+        DyFinder {
+            cx: far,
+            cy: far,
+            rings,
+        },
+    ]
 }
 
 fn export_svg_file_name() -> String {
@@ -951,9 +1263,15 @@ fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
-fn process_image(img: DynamicImage, job_id: u64, show_diff_overlay: bool) -> ProcessResult {
+fn process_image(
+    img: DynamicImage,
+    job_id: u64,
+    show_diff_overlay: bool,
+    code_kind_override: Option<CodeKind>,
+) -> ProcessResult {
     let binary = preprocess(&img);
-    let code_kind = detect::detect_kind_with_image(&img, &binary);
+    let code_kind =
+        code_kind_override.unwrap_or_else(|| detect::detect_kind_with_image(&img, &binary));
     let mut result = ProcessResult {
         code_kind,
         status: String::from("图像已加载；未识别到支持的码类型"),
@@ -967,6 +1285,7 @@ fn process_image(img: DynamicImage, job_id: u64, show_diff_overlay: bool) -> Pro
         last_matrix: None,
         qr_reference_matrix: None,
         matched_mask: None,
+        last_data_matrix_grid: None,
         last_wx_grid: None,
         last_dy_grid: None,
         last_svg: None,
@@ -976,6 +1295,9 @@ fn process_image(img: DynamicImage, job_id: u64, show_diff_overlay: bool) -> Pro
 
     match code_kind {
         CodeKind::Qr => process_qr_image(&img, &binary, job_id, show_diff_overlay, &mut result),
+        CodeKind::DataMatrix => {
+            process_data_matrix_image(&img, &binary, job_id, show_diff_overlay, &mut result)
+        }
         CodeKind::WxMiniprogram => {
             process_wx_image(&img, &binary, job_id, show_diff_overlay, &mut result)
         }
@@ -1137,6 +1459,96 @@ fn try_use_decodeless_qr_grid_fallback(
     result.preview = Some((preview_name, preview));
 
     Ok(version)
+}
+
+fn process_data_matrix_image(
+    img: &DynamicImage,
+    binary: &BinaryImage,
+    job_id: u64,
+    show_diff_overlay: bool,
+    result: &mut ProcessResult,
+) {
+    let candidates = find_data_matrix_candidates(binary);
+    let Some(best) = best_data_matrix_processing_candidate(img, &candidates) else {
+        result.status = format!(
+            "已识别 Data Matrix 候选失败：无法从 {} 个候选中采样出合法网格",
+            candidates.len()
+        );
+        return;
+    };
+
+    let svg = data_matrix_grid_to_svg(&best.grid);
+    let (preview, diff_count) = data_matrix_grid_to_diff_preview_image(
+        &best.grid,
+        &best.binary,
+        show_diff_overlay,
+        PREVIEW_SIZE,
+    );
+    result.warped = Some(best.binary);
+    result.last_data_matrix_grid = Some(best.grid.clone());
+    result.last_svg = Some(svg);
+    result.last_diff_count = Some(diff_count);
+    result.preview = Some((
+        format!(
+            "preview-data-matrix-{}x{}-{job_id}",
+            best.grid.cols, best.grid.rows
+        ),
+        preview,
+    ));
+    result.status = format!(
+        "已识别 Data Matrix：{} x {} 模块；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+        best.grid.cols, best.grid.rows
+    );
+}
+
+struct ProcessedDataMatrixCandidate {
+    binary: BinaryImage,
+    grid: DataMatrixGrid,
+}
+
+fn best_data_matrix_processing_candidate(
+    img: &DynamicImage,
+    candidates: &[DataMatrixCandidate],
+) -> Option<ProcessedDataMatrixCandidate> {
+    let mut best: Option<(f64, ProcessedDataMatrixCandidate)> = None;
+
+    for candidate in candidates.iter().take(8).copied() {
+        let (width, height) = data_matrix_warp_size(candidate);
+        let corrected_source = warp_corners_to_image(img, &candidate.corners, width, height);
+        let corrected_binary = preprocess(&corrected_source);
+        let Ok(grid) = sample_data_matrix_grid_for_symbol(&corrected_binary, candidate.symbol)
+            .or_else(|_| sample_data_matrix_grid(&corrected_binary))
+        else {
+            continue;
+        };
+        let (_, diff_count) =
+            data_matrix_grid_to_diff_preview_image(&grid, &corrected_binary, false, PREVIEW_SIZE);
+        let pixel_total = (width as f64 * height as f64).max(1.0);
+        let score = grid.score + candidate.score * 0.10 - diff_count as f64 / pixel_total * 0.04;
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((
+                score,
+                ProcessedDataMatrixCandidate {
+                    binary: corrected_binary,
+                    grid,
+                },
+            ));
+        }
+    }
+
+    best.map(|(_, processed)| processed)
+}
+
+fn data_matrix_warp_size(candidate: DataMatrixCandidate) -> (u32, u32) {
+    let max_modules = candidate.rows().max(candidate.cols()).max(1) as u32;
+    let module_px = (PREVIEW_SIZE / max_modules).clamp(4, 64);
+    (
+        candidate.cols() as u32 * module_px,
+        candidate.rows() as u32 * module_px,
+    )
 }
 
 fn process_wx_image(
@@ -1972,6 +2384,7 @@ impl eframe::App for QRacerApp {
             ui::toolbar::show(ui_, self, ctx);
         });
         self.support_dialog.show(ctx);
+        ui::manual_calibration::show(ctx, self);
 
         // 底部状态栏
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui_| {
@@ -1991,6 +2404,7 @@ impl eframe::App for QRacerApp {
         // 中央：左右对比预览
         egui::CentralPanel::default().show(ctx, |ui_| {
             ui::mask_panel::show(ui_, self);
+            ui::data_matrix_panel::show(ui_, self);
             ui::wx_panel::show(ui_, self);
             ui::dy_panel::show(ui_, self);
             ui_.separator();

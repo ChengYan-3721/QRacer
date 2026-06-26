@@ -60,6 +60,7 @@ pub fn warp_qr_to_square_image(
     DynamicImage::ImageRgba8(out)
 }
 
+#[allow(dead_code)]
 pub fn warp_wx_to_upright_binary(
     bin: &BinaryImage,
     finders: &[WxFinder; 3],
@@ -195,6 +196,7 @@ pub fn wx_upright_target_finders(_finders: &[WxFinder; 3], target_size: u32) -> 
     ]
 }
 
+#[allow(dead_code)]
 pub fn warp_dy_to_upright_binary(
     bin: &BinaryImage,
     finders: &[DyFinder; 3],
@@ -203,6 +205,7 @@ pub fn warp_dy_to_upright_binary(
     warp_dy_to_upright_binary_with_top_right(bin, finders, None, target_size)
 }
 
+#[allow(dead_code)]
 pub fn warp_dy_to_upright_binary_with_top_right(
     bin: &BinaryImage,
     finders: &[DyFinder; 3],
@@ -257,10 +260,19 @@ pub fn warp_dy_to_upright_image_with_top_right(
 }
 
 fn warp_image_with_inverse(image: &DynamicImage, inv: &Matrix3<f64>, size: u32) -> DynamicImage {
+    warp_image_with_inverse_size(image, inv, size, size)
+}
+
+fn warp_image_with_inverse_size(
+    image: &DynamicImage,
+    inv: &Matrix3<f64>,
+    width: u32,
+    height: u32,
+) -> DynamicImage {
     let source = image.to_rgba8();
-    let mut out = RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]));
-    for y in 0..size {
-        for x in 0..size {
+    let mut out = RgbaImage::from_pixel(width.max(1), height.max(1), Rgba([255, 255, 255, 255]));
+    for y in 0..height.max(1) {
+        for x in 0..width.max(1) {
             let p = inv * Vector3::new(x as f64, y as f64, 1.0);
             if p.z.abs() < f64::EPSILON {
                 continue;
@@ -272,6 +284,55 @@ fn warp_image_with_inverse(image: &DynamicImage, inv: &Matrix3<f64>, size: u32) 
     }
 
     DynamicImage::ImageRgba8(out)
+}
+
+pub fn warp_corners_to_image(
+    image: &DynamicImage,
+    source_corners: &[(f64, f64); 4],
+    target_width: u32,
+    target_height: u32,
+) -> DynamicImage {
+    let width = target_width.max(1);
+    let height = target_height.max(1);
+    let max_x = width.saturating_sub(1) as f64;
+    let max_y = height.saturating_sub(1) as f64;
+    let dst = [(0.0, 0.0), (max_x, 0.0), (0.0, max_y), (max_x, max_y)];
+    let h = homography_from_4pts(source_corners, &dst);
+    let Some(inv) = h.try_inverse() else {
+        return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            width,
+            height,
+            Rgba([255, 255, 255, 255]),
+        ));
+    };
+
+    warp_image_with_inverse_size(image, &inv, width, height)
+}
+
+pub fn warp_image_corners_to_square(
+    image: &DynamicImage,
+    destination_corners: &[(f64, f64); 4],
+    target_size: u32,
+) -> DynamicImage {
+    let size = target_size.max(1);
+    let src_max_x = image.width().saturating_sub(1) as f64;
+    let src_max_y = image.height().saturating_sub(1) as f64;
+    let src = [
+        (0.0, 0.0),
+        (src_max_x, 0.0),
+        (0.0, src_max_y),
+        (src_max_x, src_max_y),
+    ];
+    let h = homography_from_4pts(&src, destination_corners);
+    let Some(inv) = h.try_inverse() else {
+        return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            size,
+            size,
+            Rgba([255, 255, 255, 255]),
+        ));
+    };
+
+    warp_image_with_inverse(image, &inv, size)
 }
 
 pub struct DyUprightCorrection {

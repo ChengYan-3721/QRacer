@@ -321,6 +321,7 @@ pub fn detect_dy_params(bin: &BinaryImage, finders: &[DyFinder; 3]) -> Result<Dy
 }
 
 /// Samples a Douyin code into its radial grid.
+#[allow(dead_code)]
 pub fn sample_dy(bin: &BinaryImage, finders: &[DyFinder; 3], params: DyParams) -> Result<DyGrid> {
     sample_dy_impl(bin, None, finders, params)
 }

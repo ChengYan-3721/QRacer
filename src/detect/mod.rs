@@ -1,3 +1,4 @@
+pub mod finder_dm;
 pub mod finder_dy;
 pub mod finder_qr;
 pub mod finder_wx;
@@ -30,6 +31,18 @@ fn detect_kind_impl(bin: &BinaryImage, hints: DetectionHints) -> CodeKind {
     }
 
     let circular_kind = choose_circular_kind(has_wx, has_dy, signature, hints);
+    if let Some(kind) = circular_kind
+        && circular_kind_has_color_hint(kind, hints)
+        && (!has_qr || circular_kind_is_confident(kind, signature, hints))
+    {
+        return kind;
+    }
+
+    let data_matrix = finder_dm::select_data_matrix_candidate(bin);
+    if data_matrix.is_some() {
+        return CodeKind::DataMatrix;
+    }
+
     if let Some(kind) = circular_kind
         && (!has_qr || circular_kind_is_confident(kind, signature, hints))
     {
@@ -122,6 +135,22 @@ fn circular_kind_is_confident(
         }),
         _ => false,
     }
+}
+
+fn circular_kind_has_color_hint(kind: CodeKind, hints: DetectionHints) -> bool {
+    matches!(
+        (kind, hints),
+        (
+            CodeKind::WxMiniprogram,
+            DetectionHints { wx_badge: true, .. }
+        ) | (
+            CodeKind::Douyin,
+            DetectionHints {
+                douyin_logo: true,
+                ..
+            }
+        )
+    )
 }
 
 fn polar_signature(bin: &BinaryImage) -> Option<PolarSignature> {

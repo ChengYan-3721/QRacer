@@ -1,3 +1,4 @@
+use crate::codec::data_matrix_grid::DataMatrixGrid;
 use crate::codec::dy_grid::{DyBadgeStyle, DyGrid, RingSpec};
 use crate::codec::qr::QrMatrix;
 use crate::codec::wx_grid::WxGrid;
@@ -715,6 +716,96 @@ pub fn qr_matrix_to_preview_image(
     }
 
     DynamicImage::ImageRgba8(image)
+}
+
+pub fn data_matrix_grid_to_svg(grid: &DataMatrixGrid) -> String {
+    let module_mm = 1.0_f64;
+    let width = grid.cols as f64 * module_mm;
+    let height = grid.rows as f64 * module_mm;
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width:.3}mm" height="{height:.3}mm" viewBox="0 0 {width:.3} {height:.3}" shape-rendering="crispEdges">"#
+    ));
+    svg.push_str(&format!(
+        r##"<rect x="0" y="0" width="{width:.3}" height="{height:.3}" fill="#fff"/>"##
+    ));
+
+    for (y, row) in grid.matrix.iter().enumerate() {
+        for (x, &is_black) in row.iter().enumerate() {
+            if !is_black {
+                continue;
+            }
+            let px = x as f64 * module_mm;
+            let py = y as f64 * module_mm;
+            svg.push_str(&format!(
+                r##"<rect x="{px:.3}" y="{py:.3}" width="{module_mm:.3}" height="{module_mm:.3}" fill="#000"/>"##
+            ));
+        }
+    }
+
+    svg.push_str("</svg>");
+    svg
+}
+
+pub fn data_matrix_grid_to_preview_image(grid: &DataMatrixGrid, size: u32) -> DynamicImage {
+    data_matrix_grid_to_diff_preview_image(grid, &BinaryImage::new(0, 0, Vec::new()), false, size).0
+}
+
+pub fn data_matrix_grid_to_diff_preview_image(
+    grid: &DataMatrixGrid,
+    source: &BinaryImage,
+    show_diff: bool,
+    size: u32,
+) -> (DynamicImage, u32) {
+    let rows = grid.rows.max(1) as u32;
+    let cols = grid.cols.max(1) as u32;
+    let scale = (size.max(1) / rows.max(cols)).max(2);
+    let width = cols * scale;
+    let height = rows * scale;
+    let mut image = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+    let mut diff_count = 0_u32;
+
+    for y in 0..height {
+        for x in 0..width {
+            let module_x = (x / scale).min(cols - 1) as usize;
+            let module_y = (y / scale).min(rows - 1) as usize;
+            let generated_black = grid
+                .matrix
+                .get(module_y)
+                .and_then(|row| row.get(module_x))
+                .copied()
+                .unwrap_or(false);
+            let mut color = if generated_black {
+                Rgba([0, 0, 0, 255])
+            } else {
+                Rgba([255, 255, 255, 255])
+            };
+
+            if source.w > 0 && source.h > 0 {
+                let sx = ((x as f64 + 0.5) / width as f64 * source.w as f64)
+                    .floor()
+                    .clamp(0.0, source.w.saturating_sub(1) as f64) as i32;
+                let sy = ((y as f64 + 0.5) / height as f64 * source.h as f64)
+                    .floor()
+                    .clamp(0.0, source.h.saturating_sub(1) as f64) as i32;
+                let source_black = source.is_black(sx, sy);
+                if source_black != generated_black {
+                    diff_count += 1;
+                    if show_diff {
+                        color = if source_black {
+                            Rgba([220, 32, 32, 255])
+                        } else {
+                            Rgba([32, 96, 220, 255])
+                        };
+                    }
+                }
+            }
+
+            image.put_pixel(x, y, color);
+        }
+    }
+
+    (DynamicImage::ImageRgba8(image), diff_count)
 }
 
 fn qr_preview_style_padding(appearance: QrAppearance, scale: u32) -> u32 {

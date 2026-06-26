@@ -60,6 +60,7 @@ pub fn detect_wx_version(bin: &BinaryImage, finders: &[WxFinder; 3]) -> Result<u
     Ok(estimated)
 }
 
+#[allow(dead_code)]
 pub fn sample_wx(bin: &BinaryImage, finders: &[WxFinder; 3], version: u32) -> Result<WxGrid> {
     sample_wx_impl(bin, None, finders, version)
 }

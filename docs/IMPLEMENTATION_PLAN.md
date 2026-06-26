@@ -1,7 +1,7 @@
 # QRacer 分步实施计划
 
-> 文档版本：v1.0  
-> 最后更新：2026-06-05
+> 文档版本：v1.2
+> 最后更新：2026-06-26
 > 适用对象：AI 开发者（自主执行）+ 人类审阅者
 
 本文档把 [ARCHITECTURE.md](./ARCHITECTURE.md) 的路线图拆解为可单独 PR / 单独执行的任务。**每个任务包含：依赖、目标、详细步骤、文件清单、验收标准**。AI 开发者可以按顺序读、直接照做。
@@ -671,7 +671,7 @@ fn grid_sampling_recovers_perfect_qr() {
 - 已实现 `src/detect/finder_wx.rs`：通过黑色连通域、圆度近似和同心嵌套关系检测小程序码三牛眼定位点，并在 `detect_kind()` 中接入 `CodeKind::WxMiniprogram`
 - 已新增 `src/codec/wx_grid.rs`：根据三牛眼推算极坐标几何，按 36/54/72 线版本进行径向采样，每线固定 13 点
 - 已新增 `vector::shapes::polar_sector_path()`，并在 `src/vector/svg.rs` 中支持小程序码圆角矩形/圆点 SVG 输出和右侧预览光栅化
-- 已接入 `QRacerApp`：粘贴/打开小程序码后自动识别、采样、生成 SVG；小程序码掩膜面板隐藏，显示“重新采样”和“显示差异”入口，工具栏“导出 SVG”复用既有流程
+- 已接入 `QRacerApp`：粘贴/打开小程序码后自动识别、采样、生成 SVG；小程序码掩膜面板隐藏，显示“手动校准”和“显示差异”入口，工具栏“导出 SVG”复用既有流程
 
 **调参记录（2026-05-30）**：
 - 已用 `samples/` 下 9 张标准小程序码调参：三牛眼检测增加标准左上/右上/左下象限模板匹配兜底，并按等腰直角三角形约束选择定位点
@@ -820,7 +820,7 @@ fn grid_sampling_recovers_perfect_qr() {
 
 **步骤**：
 1. `wx_grid_to_diff_preview_image`：把小程序码生成预览映射回原图二值图，按像素比较原图/生成图黑白差异
-2. UI 中识别到 `CodeKind::WxMiniprogram` 时，掩膜面板隐藏（小程序码没掩膜），显示"重新采样"、"显示差异"和差异像素数
+2. UI 中识别到 `CodeKind::WxMiniprogram` 时，掩膜面板隐藏（小程序码没掩膜），显示"手动校准"、"显示差异"和差异像素数
 3. 状态栏写明红色=原图有生成图没有、蓝色=原图没有生成图有
 
 **验收**：完整流程能跑通：粘贴小程序码 → 自动识别 → 矢量预览/差异预览 → 导出 SVG
@@ -833,7 +833,7 @@ fn grid_sampling_recovers_perfect_qr() {
 - 已实现 `src/detect/finder_dy.rs`：通过黑色连通域、圆度近似、同心嵌套和角落模板扫描检测抖音码左上、左下、右下三同心圆定位点；选点时加入 TL/BL/BR 方向约束，避免把小程序码 TL/TR/BL 三牛眼误判为抖音码
 - 已在 `src/detect/mod.rs` 接入整体判型：结合 QR finder、小程序码/抖音码三点候选、彩色徽标和极坐标纹理签名，避免抖音码误识别成 QR，也避免小程序码误识别成抖音码
 - 已新增 `src/codec/dy_grid.rs`：根据三定位点推算圆心、内外半径、边框状态、编码环和编码每环点数，并按极坐标采样得到 `DyGrid`；黑框版拆成 3、4 或 5 条编码环、1 个两段式外黑框和 2 条独立细环；前三条编码环固定存在，第 4/5 条候选内环按原图黑点密度、run 数、平均 run 长度和最长 run 长度逐层启用，避免中心 Logo 或徽标长弧被误判成编码环；外黑框按 `samples/两段外黑框.svg` 的 4 条切线生成两段完整扇环，其中 3 条可变切线用原图黑白边缘连续搜索；细环使用原图 Otsu 二值图按 720 角、5x7 专用采样核采样，120 点黑框版会在闭合前删掉徽标边缘 4 点以内短 run，再做小白缝闭合；右上徽标保留区内编码环保持空白，黑框版编码环不避让三牛眼白底，黑框版 72/120 点编码环使用不同徽标保留半径，120 点最外编码环额外剪掉紧邻徽标保留区的短 run，但不再做 7x5 宽核编码补采；细环按 72/120 点版本使用不同徽标避让半径；黑框版点数在 72/120 中评分选择，编码环采样和 SVG 导出都使用标准相位并按三牛眼对角线补偿整图旋转，`samples/黑框版2.jpg` 锁定为 120 点/编码环，旧 4 条标准编码环与 `samples/黑框版2.svg` 的 `g#c` 标准点位逐点一致；无框版固定 120 点/环、6 环
-- 已接入应用流程和 UI：导入抖音码后先用原始三定位点把图像转正，再在转正后的彩色图和二值图上检测参数、采样、生成 SVG 和右侧预览；抖音面板提供重新采样、显示差异、可见总环数、编码每环点数、边框状态和差异像素数；黑框版可见环数按编码环 + 2 条细装饰环统计，外黑框不计入环数，本地标准样本覆盖 5/6/7 环
+- 已接入应用流程和 UI：导入抖音码后先用原始三定位点把图像转正，再在转正后的彩色图和二值图上检测参数、采样、生成 SVG 和右侧预览；抖音面板提供手动校准、显示差异、可见总环数、编码每环点数、边框状态和差异像素数；黑框版可见环数按编码环 + 2 条细装饰环统计，外黑框不计入环数，本地标准样本覆盖 5/6/7 环
 - 已在 `src/vector/svg.rs` 支持抖音码 SVG、光栅预览和像素级差异预览；同环连续黑点会先合并成 run，黑框版把两段外黑框和两条细环输出到 `g#a`，72 点和 120 点固定 `g#b` 由同一套内置布局参数生成，不再 `include_str!` 或复用样本 SVG 整组内容，并在黑框徽标内圆追加白底，再把实际采样的 3、4 或 5 条编码环输出到最顶层 `g#c`；无框版输出封闭填充圆角弧条，单个独立点输出真实 `<circle>`；旧右上角徽标为黑外圈、白内圈，并嵌入从新版 `samples/黑框版1.svg` 提取后内置的三色 Douyin logo path
 - 黑框版右上固定徽标现在支持旧 logo 和从 `samples/黑框版另一种徽标样式.svg` 提取后内置的 bullseye 两种样式；采样时按形状局部搜索“黑中心、白间隔、黑同心环”签名选择样式，不依赖颜色，因为旧 logo 可能是彩色、灰度或近黑；SVG 输出和校正预览都使用同一个 `badge_style`，动态外框、细环、编码环和 bullseye 徽标统一使用 `#000`，旧 logo 徽标保留 `#fa1e5c`、`#5ffdff`、`#000` 三色
 - 已完成打包优化：`[profile.release]` 启用 `opt-level = "z"`、LTO、单 codegen unit、strip 和 `panic = "abort"`
@@ -1010,6 +1010,93 @@ fn grid_sampling_recovers_perfect_qr() {
 
 ---
 
+## 阶段 9：手动校准与码类型手动覆盖（已完成）
+
+**实现状态（2026-06-25）**：已完成。该阶段用于处理自动识别或自动采样不稳定的图片，重点覆盖小程序码和抖音码，尤其是无框版抖音码拍照图。
+
+**目标**：
+- 用户可手动指定码类型，避免自动判型把图片送入错误采样器。
+- 用户可在弹窗中把原图自由变换到标准参考框架，再按指定码类型重新采样。
+- 手动调整过程可撤销，避免一次误拖需要从头校准。
+
+**已实现内容**：
+- `src/code_kind.rs` 新增 `CodeKind::PROCESSABLE` 和 `can_process()`，为工具栏和校准弹窗提供可处理码类型列表。
+- `src/ui/toolbar.rs` 新增码类型下拉：`自动识别 / 二维码 (QR) / Data Matrix码 / 小程序码 / 抖音码`。选择非自动项后，`QRacerApp::code_kind_override` 会驱动后续处理路径；手动校准弹窗只支持小程序码和抖音码。
+- `src/ui/manual_calibration.rs` 新增手动校准弹窗：
+  - 展示原图纹理和当前码类型的标准参考线。
+  - 小程序码显示三牛眼和径向参考圆；抖音码显示三同心定位点、编码/装饰环、右上徽标参考。
+  - 支持拖动整图移动、拖动四角透视变形、滚轮缩放、上方旋转手柄连续旋转，以及 `逆时针 1° / 顺时针 1°` 微调按钮。
+  - 窗口内显示操作说明。
+  - 支持 `Ctrl+Z` 和“撤销”按钮回退上一步几何操作；拖动和连续滚轮缩放按一次手势记录一条撤销历史。
+- `src/pipeline/perspective.rs` 新增 `warp_image_corners_to_square()`：把用户调整后的原图四角映射到标准正方形画布，输出校准后的彩色图。
+- `src/app.rs` 新增手动校准应用路径：
+  - 小程序码：使用标准目标三牛眼，按 36/54/72 候选采样并择优。
+  - 抖音码：使用标准目标三同心圆，根据当前边框 hint 检测参数并走 `sample_dy_with_logos`。
+- `src/ui/wx_panel.rs` 和 `src/ui/dy_panel.rs` 将主操作按钮从“重新采样”替换为“手动校准”。旧 resample/process helper 保留为 `#[allow(dead_code)]` 的调试路径。
+
+**验收已通过**：
+- `cargo fmt`
+- `cargo check`
+- `cargo test`（当前普通测试中 30 个采样回归/诊断测试为 ignored）
+
+**后续可选增强**：
+- 抖音码手动校准弹窗可增加“黑框版 / 无框版”子类型选择，避免仅依赖最近一次 `last_dy_grid.has_border` 作为参考线 hint。
+- 可增加键盘微调（方向键平移、Shift 加速、Q/E 旋转）或角点数值输入，便于精细对齐。
+- QR 和 Data Matrix 暂不提供手动校准入口；二者依赖自动网格/尺寸推断和差异预览确认结果。
+
+---
+
+## 阶段 10：Data Matrix ECC 200 检测与网格采样（已完成）
+
+**实现状态（2026-06-26）**：已完成。该阶段新增 Data Matrix 码类型，目标与 QR 网格像素匹配一致：不依赖解码重生成，直接从校正图采样模块矩阵，保证 SVG 与原图模块布局一致。
+
+**资料依据**：
+- Data Matrix ECC 200 的标准几何：左边和底边为连续黑色 L 形 finder，上边和右边为黑白交替 timing/clock track。
+- 参考 ZXing DataMatrix `Detector` 的检测后 `sampleGrid` 思路，以及 `SymbolInfo` 中的合法符号尺寸表。
+- 公开实现参考：<https://github.com/zxing/zxing/blob/master/core/src/main/java/com/google/zxing/datamatrix/detector/Detector.java>，<https://github.com/zxing/zxing/blob/master/core/src/main/java/com/google/zxing/datamatrix/encoder/SymbolInfo.java>。
+
+**目标**：
+- 新增 `CodeKind::DataMatrix`，支持自动识别和手动覆盖。
+- 支持 ECC 200 方形和矩形符号，不把矩形码强制拉成正方形。
+- 以 Data Matrix 自身的 L/timing 边和 data region 边界评分校准采样网格。
+- SVG 直接输出采样矩阵，不做 payload 解码或重生成。
+
+**已实现内容**：
+- `src/code_kind.rs`：新增 `CodeKind::DataMatrix`，加入 `PROCESSABLE` 和 `can_process()`。
+- `src/codec/data_matrix_grid.rs`：新增 Data Matrix symbol 表、`DataMatrixSymbol`、`DataMatrixGrid`、尺寸推断和网格采样。
+  - 覆盖合法 ECC 200 方形与矩形 symbol size。
+  - 已知 symbol 时围绕默认网格做 shift/scale 搜索。
+  - 未知 symbol 时先按长宽比和粗采样评分筛候选，再做完整网格细化。
+  - 评分同时看外部 L 形 finder、top/right timing 边和 data region 内部边界。
+- `src/detect/finder_dm.rs`：新增 Data Matrix 候选检测。
+  - 从黑色连通域生成轴向/旋转矩形候选。
+  - 使用外部 L/timing 边、候选长宽比和合法 symbol 尺寸评分。
+  - `detect/mod.rs` 在可信 QR 之后、普通小程序/抖音圆形启发式之前接入 Data Matrix；有明确微信绿色徽标或抖音彩色 logo 的圆形码仍优先返回，减少真实圆形码回归。
+- `src/pipeline/perspective.rs`：新增 `warp_corners_to_image()`，支持把候选四角校正到指定宽高的矩形画布。
+- `src/vector/svg.rs`：新增 `data_matrix_grid_to_svg()`、`data_matrix_grid_to_preview_image()`、`data_matrix_grid_to_diff_preview_image()`。
+  - SVG 按采样矩阵逐黑模块输出 `<rect>`。
+  - 差异预览按矩形网格映射回校正二值图，红/蓝含义沿用 QR。
+- `src/ui/data_matrix_panel.rs`：新增 Data Matrix 识别结果面板，提供“显示差异”、差异像素数和模块尺寸提示；不提供手动校准入口，因为 Data Matrix 的方形/矩形 symbol size 需要由合法 ECC 200 网格自动推断。
+- `src/app.rs`：新增 Data Matrix 自动处理路径。
+  - 自动路径：检测候选 → 矩形透视校正原彩色图 → 重二值化 → 按候选 symbol 或自动推断采样 → SVG/预览/差异输出。
+  - `ProcessResult` 和 `QRacerApp` 保存 `last_data_matrix_grid`，并在切换差异预览时刷新。
+- `src/ui/manual_calibration.rs`：Data Matrix 参考线显示 L 形 finder、交替 timing 边和基础模块网格，方便人工对齐。
+
+**验收已通过**：
+- `cargo fmt`
+- `cargo test data_matrix -- --nocapture`
+  - `codec::data_matrix_grid::tests::sampling_recovers_synthetic_square_symbol`
+  - `codec::data_matrix_grid::tests::sampling_recovers_synthetic_rectangular_symbol`
+  - `detect::finder_dm::tests::detects_synthetic_data_matrix_component`
+- `cargo test`：3 passed，30 ignored。
+
+**限制与后续增强**：
+- 当前自动化验证使用合成方形/矩形 ECC 200 符号，尚未加入真实 Data Matrix 拍照 fixture。
+- 真实印刷/拍照图如果存在强反光、模块粘连或背景纹理，可能需要扩展候选检测的局部阈值和边界评分。
+- 后续可补充 `tests/fixtures/datamatrix/`，分别覆盖方形码、矩形码、旋转透视、低对比度和局部遮挡样本。
+
+---
+
 ## 全局质量门
 
 每个 PR 合并前必须满足：
@@ -1048,6 +1135,9 @@ fn grid_sampling_recovers_perfect_qr() {
 - **单应矩阵（Homography）**：3×3 矩阵，描述两个平面间的透视变换
 - **DLT**：Direct Linear Transform，从 4 对点对应求单应矩阵的线性方法
 - **Otsu**：图像二值化的自动阈值法
+- **Data Matrix**：ISO/IEC 16022 定义的二维矩阵码；当前实现覆盖 ECC 200 几何采样。
+- **Clock Track / Timing 边**：Data Matrix 上边和右边的黑白交替边，用于推断模块节距和符号尺寸。
+- **L 形 Finder**：Data Matrix 左边和底边连续黑色边界，用于定位符号方向和边界。
 - **牛眼**：小程序码定位点的俗称
 - **装饰环**：抖音码中不参与编码但仍需按原图/几何规则输出的视觉环；当前黑框版外黑框是两段式 `DyOuterFrame`，两条细环是 `DyDecorativeRing`
 

@@ -9,8 +9,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
 
     ui.horizontal_wrapped(|ui| {
         ui.label("抖音码：同心圆采样");
-        if ui.button("重新采样").clicked() {
-            app.resample_dy();
+        if ui.button("手动校准").clicked() {
+            app.open_manual_calibration();
         }
 
         let mut show_diff = app.show_diff_overlay;

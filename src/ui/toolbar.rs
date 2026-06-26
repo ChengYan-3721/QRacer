@@ -1,6 +1,7 @@
 // 顶部工具栏：粘贴 / 打开 / 导出 / 复制 + 码类型显示。
 
 use crate::app::QRacerApp;
+use crate::code_kind::CodeKind;
 use eframe::egui;
 
 pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
@@ -33,11 +34,30 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
         ui.separator();
 
         ui.label("码类型：");
-        ui.label(
-            egui::RichText::new(app.code_kind.label())
-                .strong()
-                .color(egui::Color32::from_rgb(60, 130, 220)),
-        );
+        let selected_text = app
+            .code_kind_override
+            .map(|kind| format!("手动：{}", kind.label()))
+            .unwrap_or_else(|| format!("自动：{}", app.code_kind.label()));
+        egui::ComboBox::from_id_salt("code-kind-select")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(app.code_kind_override.is_none(), "自动识别")
+                    .clicked()
+                {
+                    app.set_code_kind_override(None);
+                    ui.close();
+                }
+                for kind in CodeKind::PROCESSABLE {
+                    if ui
+                        .selectable_label(app.code_kind_override == Some(kind), kind.label())
+                        .clicked()
+                    {
+                        app.set_code_kind_override(Some(kind));
+                        ui.close();
+                    }
+                }
+            });
 
         ui.separator();
 

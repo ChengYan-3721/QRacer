@@ -7,6 +7,8 @@ pub enum QRacerError {
     UnknownCodeKind,
     #[error("QR decode failed: {0}")]
     QrDecode(String),
+    #[error("Data Matrix sampling failed: {0}")]
+    DataMatrix(String),
     #[error("clipboard access failed: {0}")]
     Clipboard(String),
     #[error("perspective correction failed: {0}")]

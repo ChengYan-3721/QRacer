@@ -6,18 +6,40 @@ use std::fmt;
 pub enum CodeKind {
     Unknown,
     Qr,
+    DataMatrix,
     WxMiniprogram,
     Douyin,
 }
 
 impl CodeKind {
+    pub const PROCESSABLE: [CodeKind; 4] = [
+        CodeKind::Qr,
+        CodeKind::DataMatrix,
+        CodeKind::WxMiniprogram,
+        CodeKind::Douyin,
+    ];
+
+    pub const MANUAL_CALIBRATION: [CodeKind; 2] = [CodeKind::WxMiniprogram, CodeKind::Douyin];
+
     pub fn label(self) -> &'static str {
         match self {
             CodeKind::Unknown => "未识别",
             CodeKind::Qr => "二维码 (QR)",
+            CodeKind::DataMatrix => "Data Matrix码",
             CodeKind::WxMiniprogram => "小程序码",
             CodeKind::Douyin => "抖音码",
         }
+    }
+
+    pub fn can_process(self) -> bool {
+        matches!(
+            self,
+            CodeKind::Qr | CodeKind::DataMatrix | CodeKind::WxMiniprogram | CodeKind::Douyin
+        )
+    }
+
+    pub fn can_manual_calibrate(self) -> bool {
+        matches!(self, CodeKind::WxMiniprogram | CodeKind::Douyin)
     }
 }
 
