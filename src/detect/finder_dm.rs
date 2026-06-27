@@ -2,8 +2,8 @@ use crate::codec::data_matrix_grid::{DataMatrixSymbol, score_data_matrix_corners
 use crate::pipeline::preprocess::BinaryImage;
 
 const MAX_COMPONENT_POINTS: usize = 6_000;
-const MAX_COMPONENTS_TO_SCORE: usize = 3;
-const MIN_DETECTION_SCORE: f64 = 0.70;
+const MAX_COMPONENTS_TO_SCORE: usize = 16;
+const MIN_DETECTION_SCORE: f64 = 0.60;
 const EARLY_ACCEPT_SCORE: f64 = 0.88;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,29 +36,22 @@ pub fn find_data_matrix_candidates(bin: &BinaryImage) -> Vec<DataMatrixCandidate
     components.sort_by(|a, b| b.area.cmp(&a.area));
 
     let mut candidates = Vec::new();
+    if let Some(component) = merged_foreground_component(bin, &components) {
+        if let Some(candidate) = add_component_candidates(bin, &component, &mut candidates) {
+            return vec![candidate];
+        }
+    }
+
     for component in components
-        .into_iter()
-        .filter(component_size_is_plausible)
+        .iter()
+        .filter(|component| {
+            component_size_is_plausible(component)
+                && !component_touches_image_border(bin, component)
+        })
         .take(MAX_COMPONENTS_TO_SCORE)
     {
-        for rect in component_rectangles(&component) {
-            for corners in corner_orientations(rect) {
-                let Some(score) = score_data_matrix_corners(bin, &corners) else {
-                    continue;
-                };
-                if score.score < MIN_DETECTION_SCORE {
-                    continue;
-                }
-                let candidate = DataMatrixCandidate {
-                    corners,
-                    symbol: score.symbol,
-                    score: score.score,
-                };
-                if candidate.score >= EARLY_ACCEPT_SCORE {
-                    return vec![candidate];
-                }
-                candidates.push(candidate);
-            }
+        if let Some(candidate) = add_component_candidates(bin, component, &mut candidates) {
+            return vec![candidate];
         }
     }
 
@@ -110,6 +103,23 @@ impl BlackComponent {
 
     fn height(&self) -> i32 {
         self.max_y - self.min_y + 1
+    }
+
+    fn merge(&mut self, other: &BlackComponent) {
+        self.area += other.area;
+        self.min_x = self.min_x.min(other.min_x);
+        self.max_x = self.max_x.max(other.max_x);
+        self.min_y = self.min_y.min(other.min_y);
+        self.max_y = self.max_y.max(other.max_y);
+
+        for &point in &other.points {
+            if self.points.len() < MAX_COMPONENT_POINTS {
+                self.points.push(point);
+            } else {
+                let idx = (self.area as usize + self.points.len()) % MAX_COMPONENT_POINTS;
+                self.points[idx] = point;
+            }
+        }
     }
 }
 
@@ -168,6 +178,65 @@ fn component_size_is_plausible(component: &BlackComponent) -> bool {
     }
     let aspect = component.width() as f64 / component.height().max(1) as f64;
     (0.20..=6.0).contains(&aspect)
+}
+
+fn component_touches_image_border(bin: &BinaryImage, component: &BlackComponent) -> bool {
+    let margin = ((bin.w.min(bin.h) as f64 * 0.02).round() as i32).max(3);
+    component.min_x <= margin
+        || component.min_y <= margin
+        || component.max_x >= bin.w.saturating_sub(1) as i32 - margin
+        || component.max_y >= bin.h.saturating_sub(1) as i32 - margin
+}
+
+fn merged_foreground_component(
+    bin: &BinaryImage,
+    components: &[BlackComponent],
+) -> Option<BlackComponent> {
+    let min_dim = bin.w.min(bin.h) as f64;
+    let min_area = (min_dim * 0.006).powi(2).max(4.0) as u32;
+    let max_noise_area = (bin.w as u64 * bin.h as u64 * 92 / 100) as u32;
+    let mut merged: Option<BlackComponent> = None;
+
+    for component in components {
+        if component.area < min_area || component.area > max_noise_area {
+            continue;
+        }
+
+        match merged.as_mut() {
+            Some(merged) => merged.merge(component),
+            None => merged = Some(component.clone()),
+        }
+    }
+
+    merged.filter(component_size_is_plausible)
+}
+
+fn add_component_candidates(
+    bin: &BinaryImage,
+    component: &BlackComponent,
+    candidates: &mut Vec<DataMatrixCandidate>,
+) -> Option<DataMatrixCandidate> {
+    for rect in component_rectangles(component) {
+        for corners in corner_orientations(rect) {
+            let Some(score) = score_data_matrix_corners(bin, &corners) else {
+                continue;
+            };
+            if score.score < MIN_DETECTION_SCORE {
+                continue;
+            }
+            let candidate = DataMatrixCandidate {
+                corners,
+                symbol: score.symbol,
+                score: score.score,
+            };
+            if candidate.score >= EARLY_ACCEPT_SCORE {
+                return Some(candidate);
+            }
+            candidates.push(candidate);
+        }
+    }
+
+    None
 }
 
 fn component_rectangles(component: &BlackComponent) -> Vec<[(f64, f64); 4]> {

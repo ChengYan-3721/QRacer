@@ -18,7 +18,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
 
         let diff_text = app
             .last_diff_count
-            .map(|count| format!("差异：{count} 像素"))
+            .map(|count| format!("差异：{count} 模块"))
             .unwrap_or_else(|| "差异：-".to_owned());
         ui.label(diff_text);
 

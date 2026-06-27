@@ -21,6 +21,7 @@ pub struct DataMatrixGrid {
     pub symbol: DataMatrixSymbol,
     pub matrix: DataMatrixMatrix,
     pub score: f64,
+    pub sampling: DataMatrixSamplingGrid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,7 +83,7 @@ pub fn sample_data_matrix_grid(warped: &BinaryImage) -> Result<DataMatrixGrid> {
             "unable to infer Data Matrix grid size".to_owned(),
         ));
     };
-    if score < 0.68 {
+    if score < MIN_WARPED_GRID_SCORE {
         return Err(QRacerError::DataMatrix(format!(
             "Data Matrix grid score too low: {score:.3}"
         )));
@@ -93,16 +94,19 @@ pub fn sample_data_matrix_grid(warped: &BinaryImage) -> Result<DataMatrixGrid> {
     ))
 }
 
-pub fn sample_data_matrix_grid_for_symbol(
+pub fn sample_data_matrix_grid_for_symbols<I>(
     warped: &BinaryImage,
-    symbol: DataMatrixSymbol,
-) -> Result<DataMatrixGrid> {
-    let Some((symbol, grid, score)) = best_data_matrix_grid(warped, Some(symbol)) else {
+    symbols: I,
+) -> Result<DataMatrixGrid>
+where
+    I: IntoIterator<Item = DataMatrixSymbol>,
+{
+    let Some((symbol, grid, score)) = best_warped_grid_for_symbols(warped, symbols) else {
         return Err(QRacerError::DataMatrix(
             "unable to align Data Matrix sampling grid".to_owned(),
         ));
     };
-    if score < 0.62 {
+    if score < MIN_WARPED_GRID_SCORE {
         return Err(QRacerError::DataMatrix(format!(
             "Data Matrix grid score too low: {score:.3}"
         )));
@@ -118,6 +122,7 @@ pub fn score_data_matrix_corners(
     corners: &[(f64, f64); 4],
 ) -> Option<DataMatrixCornerScore> {
     let mut best: Option<(DataMatrixSymbol, f64)> = None;
+    let timing_hint = estimate_corner_timing_modules(bin, corners);
     for &symbol in DATA_MATRIX_SYMBOLS {
         let ratio_penalty = corner_aspect_penalty(corners, symbol);
         if ratio_penalty > 0.45 {
@@ -136,6 +141,7 @@ pub fn score_data_matrix_corners(
             let score = score_data_matrix_outer_symbol(symbol, grid, |x, y, grid| {
                 mapped_module_vote(bin, &h, symbol, x, y, grid)
             }) - ratio_penalty
+                - corner_timing_penalty(timing_hint, symbol)
                 - grid_penalty(grid);
             if best.is_none_or(|(_, best_score)| score > best_score) {
                 best = Some((symbol, score));
@@ -156,7 +162,8 @@ fn sample_data_matrix_grid_with_sampling(
     for (y, row) in matrix.iter_mut().enumerate() {
         for (x, module) in row.iter_mut().enumerate() {
             let (black, total) = warped_module_vote(warped, symbol, x, y, grid);
-            *module = black * 2 + 1 >= total;
+            *module = data_matrix_function_module(symbol, x, y)
+                .unwrap_or(module_vote_is_black(black, total));
         }
     }
 
@@ -166,6 +173,7 @@ fn sample_data_matrix_grid_with_sampling(
         symbol,
         matrix,
         score,
+        sampling: grid,
     }
 }
 
@@ -182,6 +190,7 @@ fn best_data_matrix_grid(
     } else {
         warped.w as f64 / warped.h as f64
     };
+    let timing = DataMatrixTimingEstimate::from_warped(warped);
     let mut coarse = Vec::new();
     for &symbol in DATA_MATRIX_SYMBOLS {
         let ratio_penalty = image_aspect_penalty(actual_ratio, symbol);
@@ -190,7 +199,7 @@ fn best_data_matrix_grid(
         }
         let mut best_symbol_score = f64::NEG_INFINITY;
         for grid in corner_sampling_grids() {
-            let score = warped_symbol_score(warped, symbol, grid, ratio_penalty);
+            let score = warped_symbol_score(warped, symbol, grid, ratio_penalty, timing);
             best_symbol_score = best_symbol_score.max(score);
         }
         coarse.push((best_symbol_score, symbol));
@@ -218,6 +227,7 @@ where
     } else {
         warped.w as f64 / warped.h as f64
     };
+    let timing = DataMatrixTimingEstimate::from_warped(warped);
 
     for symbol in symbols {
         let ratio_penalty = image_aspect_penalty(actual_ratio, symbol);
@@ -225,15 +235,56 @@ where
             continue;
         }
 
-        for grid in sampling_grids() {
-            let score = warped_symbol_score(warped, symbol, grid, ratio_penalty);
-            if best.is_none_or(|(_, _, best_score)| score > best_score) {
-                best = Some((symbol, grid, score));
-            }
-        }
+        update_best_warped_grid_for_symbol(
+            warped,
+            symbol,
+            ratio_penalty,
+            timing,
+            sampling_grids(),
+            &mut best,
+        );
     }
 
     best
+}
+
+fn update_best_warped_grid_for_symbol<I>(
+    warped: &BinaryImage,
+    symbol: DataMatrixSymbol,
+    ratio_penalty: f64,
+    timing: DataMatrixTimingEstimate,
+    grids: I,
+    best: &mut Option<(DataMatrixSymbol, DataMatrixSamplingGrid, f64)>,
+) where
+    I: IntoIterator<Item = DataMatrixSamplingGrid>,
+{
+    let mut ranked_grids = grids
+        .into_iter()
+        .enumerate()
+        .map(|(order, grid)| {
+            (
+                warped_symbol_edge_score(warped, symbol, grid, ratio_penalty, timing),
+                order,
+                grid,
+            )
+        })
+        .collect::<Vec<_>>();
+    ranked_grids.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    for (edge_score, _, grid) in ranked_grids {
+        if best
+            .as_ref()
+            .is_some_and(|(_, _, best_score)| edge_score + SAMPLING_CONTRAST_WEIGHT < *best_score)
+        {
+            break;
+        }
+
+        let score =
+            edge_score + score_sampling_contrast(warped, symbol, grid) * SAMPLING_CONTRAST_WEIGHT;
+        if best.is_none_or(|(_, _, best_score)| score > best_score) {
+            *best = Some((symbol, grid, score));
+        }
+    }
 }
 
 fn warped_symbol_score(
@@ -241,21 +292,36 @@ fn warped_symbol_score(
     symbol: DataMatrixSymbol,
     grid: DataMatrixSamplingGrid,
     ratio_penalty: f64,
+    timing: DataMatrixTimingEstimate,
+) -> f64 {
+    warped_symbol_edge_score(warped, symbol, grid, ratio_penalty, timing)
+        + score_sampling_contrast(warped, symbol, grid) * SAMPLING_CONTRAST_WEIGHT
+}
+
+fn warped_symbol_edge_score(
+    warped: &BinaryImage,
+    symbol: DataMatrixSymbol,
+    grid: DataMatrixSamplingGrid,
+    ratio_penalty: f64,
+    timing: DataMatrixTimingEstimate,
 ) -> f64 {
     score_data_matrix_symbol(symbol, grid, |x, y, grid| {
         warped_module_vote(warped, symbol, x, y, grid)
-    }) + score_sampling_contrast(warped, symbol, grid) * 0.12
-        - ratio_penalty
+    }) - ratio_penalty
+        - timing.size_penalty(symbol)
         - grid_penalty(grid)
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DataMatrixSamplingGrid {
-    shift_x: f64,
-    shift_y: f64,
-    scale_x: f64,
-    scale_y: f64,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DataMatrixSamplingGrid {
+    pub shift_x: f64,
+    pub shift_y: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
 }
+
+const SAMPLING_CONTRAST_WEIGHT: f64 = 0.12;
+const MIN_WARPED_GRID_SCORE: f64 = 0.62;
 
 fn sampling_grids() -> impl Iterator<Item = DataMatrixSamplingGrid> {
     const SHIFTS: [f64; 5] = [-0.18, -0.09, 0.0, 0.09, 0.18];
@@ -324,6 +390,22 @@ where
     scorer.finish()
 }
 
+fn data_matrix_function_module(symbol: DataMatrixSymbol, x: usize, y: usize) -> Option<bool> {
+    let region_h = symbol.region_rows + 2;
+    let region_w = symbol.region_cols + 2;
+    let local_x = x % region_w;
+    let local_y = y % region_h;
+    if local_x == 0 || local_y == region_h - 1 {
+        Some(true)
+    } else if local_y == 0 {
+        Some(local_x % 2 == 0)
+    } else if local_x == region_w - 1 {
+        Some(local_y % 2 == 1)
+    } else {
+        None
+    }
+}
+
 fn score_data_matrix_outer_symbol<F>(
     symbol: DataMatrixSymbol,
     grid: DataMatrixSamplingGrid,
@@ -342,6 +424,65 @@ where
         scorer.add(&mut vote, x, 0, x % 2 == 0, grid, 3.8);
     }
     scorer.finish()
+}
+
+fn estimate_corner_timing_modules(
+    bin: &BinaryImage,
+    corners: &[(f64, f64); 4],
+) -> (Option<usize>, Option<usize>) {
+    let top = estimate_edge_timing_modules(bin, corners[0], corners[1], corners[2], corners[3]);
+    let right = estimate_edge_timing_modules(bin, corners[1], corners[3], corners[0], corners[2]);
+    (top, right)
+}
+
+fn corner_timing_penalty(
+    timing_hint: (Option<usize>, Option<usize>),
+    symbol: DataMatrixSymbol,
+) -> f64 {
+    let horizontal = timing_hint
+        .0
+        .map(|modules| (modules as i32 - symbol.cols as i32).unsigned_abs() as f64)
+        .unwrap_or(0.0);
+    let vertical = timing_hint
+        .1
+        .map(|modules| (modules as i32 - symbol.rows as i32).unsigned_abs() as f64)
+        .unwrap_or(0.0);
+    ((horizontal + vertical) * 0.018).min(0.46)
+}
+
+fn estimate_edge_timing_modules(
+    bin: &BinaryImage,
+    edge_start: (f64, f64),
+    edge_end: (f64, f64),
+    inward_start: (f64, f64),
+    inward_end: (f64, f64),
+) -> Option<usize> {
+    let edge_len = distance(edge_start, edge_end);
+    if edge_len < 16.0 {
+        return None;
+    }
+    let inward = (
+        (inward_start.0 + inward_end.0 - edge_start.0 - edge_end.0) * 0.5,
+        (inward_start.1 + inward_end.1 - edge_start.1 - edge_end.1) * 0.5,
+    );
+    let inward_len = inward.0.hypot(inward.1);
+    if inward_len <= f64::EPSILON {
+        return None;
+    }
+    let inset = (edge_len / 48.0).clamp(1.0, 8.0);
+    let offset = (inward.0 / inward_len * inset, inward.1 / inward_len * inset);
+    let samples = edge_len.round().clamp(32.0, 768.0) as usize;
+    let min_run = (samples / 220).max(2);
+    let runs = binary_run_count(
+        (0..samples).map(|idx| {
+            let t = (idx as f64 + 0.5) / samples as f64;
+            let x = edge_start.0 + (edge_end.0 - edge_start.0) * t + offset.0;
+            let y = edge_start.1 + (edge_end.1 - edge_start.1) * t + offset.1;
+            bin.is_black(x.round() as i32, y.round() as i32)
+        }),
+        min_run,
+    );
+    (6..=160).contains(&runs).then_some(runs)
 }
 
 #[derive(Default)]
@@ -363,7 +504,7 @@ impl GridScore {
         F: FnMut(usize, usize, DataMatrixSamplingGrid) -> (usize, usize),
     {
         let (black, total) = vote(x, y, grid);
-        let actual = black * 2 + 1 >= total;
+        let actual = score_vote_is_black(black, total);
         if actual == expected {
             self.correct += weight;
         }
@@ -377,6 +518,14 @@ impl GridScore {
             self.correct / self.total
         }
     }
+}
+
+fn module_vote_is_black(black: usize, total: usize) -> bool {
+    black * 2 >= total
+}
+
+fn score_vote_is_black(black: usize, total: usize) -> bool {
+    black * 2 + 1 >= total
 }
 
 fn score_sampling_contrast(
@@ -398,6 +547,161 @@ fn score_sampling_contrast(
     }
 
     total / count.max(1) as f64
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DataMatrixTimingEstimate {
+    horizontal: Option<usize>,
+    vertical: Option<usize>,
+    solid_cols: Option<usize>,
+    solid_rows: Option<usize>,
+}
+
+impl DataMatrixTimingEstimate {
+    fn from_warped(warped: &BinaryImage) -> Self {
+        Self {
+            horizontal: estimate_horizontal_timing_modules(warped),
+            vertical: estimate_vertical_timing_modules(warped),
+            solid_cols: estimate_modules_from_left_solid_border(warped),
+            solid_rows: estimate_modules_from_bottom_solid_border(warped),
+        }
+    }
+
+    fn size_penalty(self, symbol: DataMatrixSymbol) -> f64 {
+        let horizontal = self
+            .horizontal
+            .map(|modules| (modules as i32 - symbol.cols as i32).unsigned_abs() as f64)
+            .unwrap_or(0.0);
+        let vertical = self
+            .vertical
+            .map(|modules| (modules as i32 - symbol.rows as i32).unsigned_abs() as f64)
+            .unwrap_or(0.0);
+        let solid_cols = self
+            .solid_cols
+            .map(|modules| (modules as i32 - symbol.cols as i32).unsigned_abs() as f64)
+            .unwrap_or(0.0);
+        let solid_rows = self
+            .solid_rows
+            .map(|modules| (modules as i32 - symbol.rows as i32).unsigned_abs() as f64)
+            .unwrap_or(0.0);
+        ((horizontal + vertical) * 0.014 + (solid_cols + solid_rows) * 0.026).min(0.58)
+    }
+}
+
+fn estimate_horizontal_timing_modules(warped: &BinaryImage) -> Option<usize> {
+    if warped.w < 16 || warped.h < 16 {
+        return None;
+    }
+    let y_limit = ((warped.h as usize + 4) / 5).clamp(4, 96);
+    let min_run = (warped.w as usize / 220).max(2);
+    let mut best = 0;
+    for y in 0..y_limit.min(warped.h as usize) {
+        let runs = binary_run_count(
+            (0..warped.w as i32).map(|x| warped.is_black(x, y as i32)),
+            min_run,
+        );
+        if (6..=160).contains(&runs) {
+            best = best.max(runs);
+        }
+    }
+    (best > 0).then_some(best)
+}
+
+fn estimate_vertical_timing_modules(warped: &BinaryImage) -> Option<usize> {
+    if warped.w < 16 || warped.h < 16 {
+        return None;
+    }
+    let x_start = (warped.w as usize * 4 / 5).min(warped.w.saturating_sub(1) as usize);
+    let min_run = (warped.h as usize / 220).max(2);
+    let mut best = 0;
+    for x in x_start..warped.w as usize {
+        let runs = binary_run_count(
+            (0..warped.h as i32).map(|y| warped.is_black(x as i32, y)),
+            min_run,
+        );
+        if (6..=160).contains(&runs) {
+            best = best.max(runs);
+        }
+    }
+    (best > 0).then_some(best)
+}
+
+fn estimate_modules_from_left_solid_border(warped: &BinaryImage) -> Option<usize> {
+    if warped.w < 16 || warped.h < 16 {
+        return None;
+    }
+    let y_start = warped.h as usize / 12;
+    let y_end = warped.h as usize * 11 / 12;
+    let step = (warped.h as usize / 80).max(1);
+    let max_run = (warped.w as usize / 3).max(2);
+    let mut runs = Vec::new();
+    for y in (y_start..y_end.max(y_start + 1)).step_by(step) {
+        let mut run = 0_usize;
+        while run < warped.w as usize && warped.is_black(run as i32, y as i32) {
+            run += 1;
+        }
+        if (2..=max_run).contains(&run) {
+            runs.push(run);
+        }
+    }
+    modules_from_border_runs(warped.w as usize, &mut runs)
+}
+
+fn estimate_modules_from_bottom_solid_border(warped: &BinaryImage) -> Option<usize> {
+    if warped.w < 16 || warped.h < 16 {
+        return None;
+    }
+    let x_start = warped.w as usize / 12;
+    let x_end = warped.w as usize * 11 / 12;
+    let step = (warped.w as usize / 80).max(1);
+    let max_run = (warped.h as usize / 3).max(2);
+    let mut runs = Vec::new();
+    for x in (x_start..x_end.max(x_start + 1)).step_by(step) {
+        let mut run = 0_usize;
+        while run < warped.h as usize
+            && warped.is_black(x as i32, warped.h.saturating_sub(1) as i32 - run as i32)
+        {
+            run += 1;
+        }
+        if (2..=max_run).contains(&run) {
+            runs.push(run);
+        }
+    }
+    modules_from_border_runs(warped.h as usize, &mut runs)
+}
+
+fn modules_from_border_runs(side: usize, runs: &mut [usize]) -> Option<usize> {
+    if runs.len() < 4 {
+        return None;
+    }
+    runs.sort_unstable();
+    let thickness = runs[runs.len() / 2].max(1);
+    let modules = (side as f64 / thickness as f64).round() as usize;
+    (6..=160).contains(&modules).then_some(modules)
+}
+
+fn binary_run_count<I>(values: I, min_run: usize) -> usize
+where
+    I: IntoIterator<Item = bool>,
+{
+    let mut runs: Vec<(bool, usize)> = Vec::new();
+    for value in values {
+        match runs.last_mut() {
+            Some((last, len)) if *last == value => *len += 1,
+            _ => runs.push((value, 1)),
+        }
+    }
+
+    let mut filtered: Vec<bool> = Vec::new();
+    for (value, len) in runs {
+        if len < min_run {
+            continue;
+        }
+        if filtered.last().copied() != Some(value) {
+            filtered.push(value);
+        }
+    }
+    filtered.len()
 }
 
 fn warped_module_vote(

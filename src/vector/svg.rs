@@ -765,47 +765,103 @@ pub fn data_matrix_grid_to_diff_preview_image(
     let mut image = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
     let mut diff_count = 0_u32;
 
-    for y in 0..height {
-        for x in 0..width {
-            let module_x = (x / scale).min(cols - 1) as usize;
-            let module_y = (y / scale).min(rows - 1) as usize;
+    for module_y in 0..rows as usize {
+        for module_x in 0..cols as usize {
             let generated_black = grid
                 .matrix
                 .get(module_y)
                 .and_then(|row| row.get(module_x))
                 .copied()
                 .unwrap_or(false);
-            let mut color = if generated_black {
-                Rgba([0, 0, 0, 255])
-            } else {
-                Rgba([255, 255, 255, 255])
-            };
-
-            if source.w > 0 && source.h > 0 {
-                let sx = ((x as f64 + 0.5) / width as f64 * source.w as f64)
-                    .floor()
-                    .clamp(0.0, source.w.saturating_sub(1) as f64) as i32;
-                let sy = ((y as f64 + 0.5) / height as f64 * source.h as f64)
-                    .floor()
-                    .clamp(0.0, source.h.saturating_sub(1) as f64) as i32;
-                let source_black = source.is_black(sx, sy);
-                if source_black != generated_black {
-                    diff_count += 1;
-                    if show_diff {
-                        color = if source_black {
-                            Rgba([220, 32, 32, 255])
-                        } else {
-                            Rgba([32, 96, 220, 255])
-                        };
-                    }
-                }
+            if generated_black {
+                paint_filled_rect_px(
+                    &mut image,
+                    module_x as f64 * scale as f64,
+                    module_y as f64 * scale as f64,
+                    scale as f64,
+                    scale as f64,
+                    Rgba([0, 0, 0, 255]),
+                );
             }
 
-            image.put_pixel(x, y, color);
+            if source.w == 0 || source.h == 0 {
+                continue;
+            }
+
+            let source_black =
+                data_matrix_preview_source_module_is_black(source, grid, module_x, module_y);
+            if source_black == generated_black {
+                continue;
+            }
+
+            diff_count += 1;
+            if show_diff {
+                let color = if source_black {
+                    Rgba([220, 32, 32, 255])
+                } else {
+                    Rgba([32, 96, 220, 255])
+                };
+                paint_filled_rect_px(
+                    &mut image,
+                    module_x as f64 * scale as f64,
+                    module_y as f64 * scale as f64,
+                    scale as f64,
+                    scale as f64,
+                    color,
+                );
+            }
         }
     }
 
     (DynamicImage::ImageRgba8(image), diff_count)
+}
+
+fn data_matrix_preview_source_module_is_black(
+    source: &BinaryImage,
+    grid: &DataMatrixGrid,
+    x: usize,
+    y: usize,
+) -> bool {
+    let (black, total) = data_matrix_preview_source_module_vote(source, grid, x, y);
+    black * 2 >= total
+}
+
+fn data_matrix_preview_source_module_vote(
+    source: &BinaryImage,
+    grid: &DataMatrixGrid,
+    x: usize,
+    y: usize,
+) -> (usize, usize) {
+    if grid.cols == 0 || grid.rows == 0 || source.w == 0 || source.h == 0 {
+        return (0, 1);
+    }
+
+    let cell_w = source.w as f64 / grid.cols as f64 * grid.sampling.scale_x;
+    let cell_h = source.h as f64 / grid.rows as f64 * grid.sampling.scale_y;
+    let center_x = source.w as f64 * 0.5
+        + (x as f64 + 0.5 - grid.cols as f64 * 0.5 + grid.sampling.shift_x) * cell_w;
+    let center_y = source.h as f64 * 0.5
+        + (y as f64 + 0.5 - grid.rows as f64 * 0.5 + grid.sampling.shift_y) * cell_h;
+    let offsets = [-0.18, 0.0, 0.18];
+
+    let mut black = 0;
+    let mut total = 0;
+    for oy in offsets {
+        for ox in offsets {
+            let px = (center_x + ox * cell_w)
+                .round()
+                .clamp(0.0, source.w.saturating_sub(1) as f64) as i32;
+            let py = (center_y + oy * cell_h)
+                .round()
+                .clamp(0.0, source.h.saturating_sub(1) as f64) as i32;
+            if source.is_black(px, py) {
+                black += 1;
+            }
+            total += 1;
+        }
+    }
+
+    (black, total)
 }
 
 fn qr_preview_style_padding(appearance: QrAppearance, scale: u32) -> u32 {

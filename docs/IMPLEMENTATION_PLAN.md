@@ -1068,17 +1068,24 @@ fn grid_sampling_recovers_perfect_qr() {
   - 已知 symbol 时围绕默认网格做 shift/scale 搜索。
   - 未知 symbol 时先按长宽比和粗采样评分筛候选，再做完整网格细化。
   - 评分同时看外部 L 形 finder、top/right timing 边和 data region 内部边界。
+  - 完整细化保留独立 `scale_x/scale_y` 组合，以覆盖拍照残余横纵缩放；实现上先用 L/timing 边做轻量评分排序，再用 contrast 最大增益上界剪枝，只对仍可能胜出的网格计算全模块 contrast。
+  - 采样结果会按 ECC 200 功能模块规则固定 L 形 finder 与 timing 边；数据模块使用 3x3 严格多数投票，避免拍照边缘灰阶把白模块误采成黑模块。
 - `src/detect/finder_dm.rs`：新增 Data Matrix 候选检测。
   - 从黑色连通域生成轴向/旋转矩形候选。
   - 使用外部 L/timing 边、候选长宽比和合法 symbol 尺寸评分。
+  - 对贴近图像边缘的 Data Matrix 不再简单丢弃 L 形大连通域；前景合并只排除近乎整图全黑的噪声，避免无 quiet zone 或拍照裁切样本被内部小黑块误导。
+  - 候选评分加入 top/right timing run-count 尺寸约束，减少把 24x24 方形码误判成 10x10、12x12、22x22 的情况。
   - `detect/mod.rs` 在可信 QR 之后、普通小程序/抖音圆形启发式之前接入 Data Matrix；有明确微信绿色徽标或抖音彩色 logo 的圆形码仍优先返回，减少真实圆形码回归。
 - `src/pipeline/perspective.rs`：新增 `warp_corners_to_image()`，支持把候选四角校正到指定宽高的矩形画布。
 - `src/vector/svg.rs`：新增 `data_matrix_grid_to_svg()`、`data_matrix_grid_to_preview_image()`、`data_matrix_grid_to_diff_preview_image()`。
   - SVG 按采样矩阵逐黑模块输出 `<rect>`。
   - 差异预览按矩形网格映射回校正二值图，红/蓝含义沿用 QR。
-- `src/ui/data_matrix_panel.rs`：新增 Data Matrix 识别结果面板，提供“显示差异”、差异像素数和模块尺寸提示；不提供手动校准入口，因为 Data Matrix 的方形/矩形 symbol size 需要由合法 ECC 200 网格自动推断。
+- `src/ui/data_matrix_panel.rs`：新增 Data Matrix 识别结果面板，提供“显示差异”、差异模块数和模块尺寸提示；不提供手动校准入口，因为 Data Matrix 的方形/矩形 symbol size 需要由合法 ECC 200 网格自动推断。
 - `src/app.rs`：新增 Data Matrix 自动处理路径。
   - 自动路径：检测候选 → 矩形透视校正原彩色图 → 重二值化 → 按候选 symbol 或自动推断采样 → SVG/预览/差异输出。
+  - 低置信拍照候选会在初次矩形校正后拟合左/右/上/下四条外边界并二次 warp；高置信候选跳过该步骤，避免对已稳定样本引入抖动。
+  - 对同一物理外框做去重，并对大方形候选额外尝试 22/24/26 合法方形 symbol，解决拍照样本里真实 24x24 被局部小组件或错误候选 symbol 抢分的问题。
+  - 低置信候选优先尝试原始角点顺序和 180° 对向顺序，缩放按 `1.0 / 1.04 / 0.96` 探索；高置信结果会跳过剩余旋转顺序，避免重复 warp/preprocess。候选选择阶段不再为每个组合生成差异预览图，差异图只在最终结果确定后生成。
   - `ProcessResult` 和 `QRacerApp` 保存 `last_data_matrix_grid`，并在切换差异预览时刷新。
 - `src/ui/manual_calibration.rs`：Data Matrix 参考线显示 L 形 finder、交替 timing 边和基础模块网格，方便人工对齐。
 
@@ -1088,10 +1095,14 @@ fn grid_sampling_recovers_perfect_qr() {
   - `codec::data_matrix_grid::tests::sampling_recovers_synthetic_square_symbol`
   - `codec::data_matrix_grid::tests::sampling_recovers_synthetic_rectangular_symbol`
   - `detect::finder_dm::tests::detects_synthetic_data_matrix_component`
-- `cargo test`：3 passed，30 ignored。
+- `cargo test print_data_matrix_photo_sample_diagnostics -- --ignored --nocapture`
+  - `samples/Data Matrix拍照1.jpg` 到 `samples/Data Matrix拍照5.jpg` 均采样为 24x24。
+  - 5 张拍照样本与 `samples/Data Matrix标准.jpg` 的采样矩阵逐位对比均为 `diff=0`。
+  - `cargo test --release print_data_matrix_photo_sample_diagnostics -- --ignored --nocapture`：单张拍照样本通过 `DM_SAMPLE=...` 运行约 1.5-2.2 秒（包含标准样本采样）；完整 5 张 ignored 诊断约 12 秒级。
+- `cargo test`：3 passed，31 ignored。
 
 **限制与后续增强**：
-- 当前自动化验证使用合成方形/矩形 ECC 200 符号，尚未加入真实 Data Matrix 拍照 fixture。
+- 真实 Data Matrix 拍照样本已有 ignored 诊断覆盖；由于完整拍照诊断耗时较长，暂不放入默认 `cargo test`。
 - 真实印刷/拍照图如果存在强反光、模块粘连或背景纹理，可能需要扩展候选检测的局部阈值和边界评分。
 - 后续可补充 `tests/fixtures/datamatrix/`，分别覆盖方形码、矩形码、旋转透视、低对比度和局部遮挡样本。
 

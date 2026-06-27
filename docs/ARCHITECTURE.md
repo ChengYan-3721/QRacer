@@ -363,11 +363,15 @@ pub struct DyDecorativeRing {
 ```
 
 ### 5.4 Data Matrix ECC 200 网格采样
-Data Matrix 使用标准 ECC 200 几何签名：左边和底边为连续黑色 L 形 finder，顶边和右边为黑白交替 timing/clock track。检测层先从黑色连通域得到轴向或旋转矩形候选，再用外边框和 timing pattern 得分选择候选。
+Data Matrix 使用标准 ECC 200 几何签名：左边和底边为连续黑色 L 形 finder，顶边和右边为黑白交替 timing/clock track。检测层先从黑色连通域得到轴向或旋转矩形候选，再用外边框、timing pattern 和 top/right timing run-count 得分选择候选，避免把 24x24 这类大方形码误判成内部小组件或更小 symbol。
 
-采样层不解码 payload，也不重新编码生成标准符号，而是把透视校正后的原图按合法 ECC 200 symbol size 表映射到模块网格。对未知尺寸的图先按长宽比和外边框评分粗选候选尺寸，再做 shift/scale 微调；对检测器已给出尺寸的候选直接按该 symbol 做细化。采样结果包含方形和矩形矩阵，SVG 使用 `<rect>` 逐黑模块输出，保证模块布局来自原图。
+采样层不解码 payload，也不重新编码生成标准符号，而是把透视校正后的原图按合法 ECC 200 symbol size 表映射到模块网格。对未知尺寸的图先按长宽比和外边框评分粗选候选尺寸，再做 shift/scale 微调；对检测器已给出尺寸的候选直接按该 symbol 做细化。细化阶段保留完整的独立 `scale_x/scale_y` 网格搜索以覆盖拍照残余形变，但先按 L/timing 边做轻量评分排序，再只对仍可能超过当前最佳分的网格计算全模块 contrast，避免每个网格都跑重评分。
 
-透视校正对 Data Matrix 使用 `warp_corners_to_image()` 输出矩形画布，不强制拉成正方形。这样 8×18、12×26、16×48 等矩形符号能保持原始长宽比，后续差异预览也按矩形模块坐标比较。
+低置信拍照候选会在初次校正后拟合四条真实外边界并二次 warp，高置信候选跳过该步骤以避免抖动。大方形候选会额外尝试 22/24/26 等相邻合法 symbol，并按物理外框去重，减少同一外框重复采样。应用层优先尝试原始角点顺序和 180° 对向顺序，缩放按 `1.0 / 1.04 / 0.96` 探索；一旦某个顺序得到高置信采样结果，就跳过剩余旋转顺序，保证拍照样本正确的同时减少重复 warp/preprocess。
+
+最终矩阵会强制写回 ECC 200 功能模块：左/底 L 形 finder 为黑，上/右 timing 按区域交替；数据模块使用网格中心 3x3 严格多数投票。采样结果包含方形和矩形矩阵，SVG 使用 `<rect>` 逐黑模块输出，保证模块布局来自原图。
+
+透视校正对 Data Matrix 使用 `warp_corners_to_image()` 输出矩形画布，不强制拉成正方形。这样 8×18、12×26、16×48 等矩形符号能保持原始长宽比，后续差异预览也按矩形模块坐标比较。`samples/Data Matrix拍照1.jpg` 到 `拍照5.jpg` 的 ignored 诊断会与 `Data Matrix标准.jpg` 做逐模块比较，当前 5 张拍照样本均为 24x24 且 `diff=0`；release 单张诊断约 1.5-2.2 秒（包含标准样本采样）。
 
 ### 5.5 小程序码径向采样
 ```
@@ -445,7 +449,7 @@ SVG 输出先把同一环上的连续黑采样合并成 run。黑框 72 点和 1
 2. 每个模块取中心 3x3 多数投票，与 qrcodegen 重生成矩阵比较
 3. 原图黑、生成图白的模块染红；原图白、生成图黑的模块染蓝
 4. QR 原掩膜显示不是只看 format info；8 种掩膜中必须存在一个在中心 Logo 区外差异为 0 的矩阵才算匹配。中心 Logo 区内的少量差异不影响匹配；只要中心外有差异，就显示"无匹配掩膜"，不显示"原掩膜 x"，并自动切到网格像素匹配采样
-5. Data Matrix 使用 `data_matrix_grid_to_diff_preview_image` 做矩形网格像素级对比，红/蓝含义与 QR 一致
+5. Data Matrix 使用 `data_matrix_grid_to_diff_preview_image` 做矩形网格模块级对比，红/蓝含义与 QR 一致
 6. 小程序码使用 `wx_grid_to_diff_preview_image` 做像素级对比，红/蓝含义与 QR 一致，徽标和中心 Logo 区域忽略
 7. 掩膜面板/小程序码面板都提供"显示差异"开关；状态栏在差异数后写明红/蓝含义
 8. 原图坐标系半透明叠加需要保留 homography 后再做反投影，可作为后续增强
@@ -663,11 +667,13 @@ QR 标准矩阵输出在 `vector::svg::QrAppearance` 中支持三种外观：`St
 
 Data Matrix 支持 ECC 200 的方形和矩形符号。实现依据公开几何特征：左边、底边为连续黑色 finder 边，上边、右边为黑白交替 timing 边；内部每个 data region 也带相同的边界结构。`DATA_MATRIX_SYMBOLS` 保存合法 symbol size、region 划分和长宽比，用于尺寸推断和采样评分。
 
-自动路径在 `detect/finder_dm.rs` 中从黑色连通域生成矩形候选，分别评分外部 L/timing 边和尺寸长宽比。处理时用 `warp_corners_to_image()` 将候选四角映射到对应宽高的校正图，再重新二值化，交给 `sample_data_matrix_grid_for_symbol()` 或通用 `sample_data_matrix_grid()` 采样。
+自动路径在 `detect/finder_dm.rs` 中从黑色连通域生成矩形候选，分别评分外部 L/timing 边、尺寸长宽比和 timing run-count。处理时用 `warp_corners_to_image()` 将候选四角映射到对应宽高的校正图，再重新二值化；低置信候选会拟合校正图中的四条真实外边界并二次 warp，再交给 `sample_data_matrix_grid_for_symbols()` 或通用 `sample_data_matrix_grid()` 采样。
 
 采样路径在 `codec/data_matrix_grid.rs` 中完成：
 - 已知尺寸时围绕默认网格做小范围 shift/scale 搜索，按外边框、timing 边和 data region 内边界评分。
 - 未知尺寸时先按图像长宽比和粗采样评分筛出少量候选，再进入完整网格细化。
-- 每个模块按校正图网格中心采样，结果保存为 `DataMatrixGrid::matrix`。
+- 完整细化仍允许 `scale_x` 与 `scale_y` 独立变化；评分先用边框/时钟线轻量分排序，并用 contrast 最大增益上界剪枝，只对少量有机会胜出的网格计算全模块 contrast。
+- 大方形拍照候选额外尝试 22/24/26 合法方形 symbol，并按物理外框去重，避免同一外框重复采样或被内部小黑块抢分。
+- 每个模块按校正图网格中心采样；功能模块按 ECC 200 L/timing 规则固定，数据模块按 3x3 严格多数投票，结果保存为 `DataMatrixGrid::matrix`。
 
-SVG 和预览在 `vector/svg.rs` 中实现，直接从 `DataMatrixGrid` 输出黑模块，不做 payload 解码或重生成。差异预览使用采样矩阵与校正二值图做像素级比较，状态栏显示模块尺寸和红/蓝差异数量。`ui/data_matrix_panel.rs` 在识别完成后提供“显示差异”和模块尺寸提示，不提供手动校准入口；Data Matrix 符号尺寸需由合法 ECC 200 网格自动推断。当前自动化测试覆盖合成方形符号、合成矩形符号和合成候选检测；真实拍照 Data Matrix fixture 仍待补充。
+SVG 和预览在 `vector/svg.rs` 中实现，直接从 `DataMatrixGrid` 输出黑模块，不做 payload 解码或重生成。差异预览使用采样时保存的 shift/scale 网格对校正二值图做模块级 3x3 投票比较，状态栏显示模块尺寸和红/蓝差异模块数，避免拍照边缘像素误差淹没真实差异。`ui/data_matrix_panel.rs` 在识别完成后提供“显示差异”和模块尺寸提示，不提供手动校准入口；Data Matrix 符号尺寸需由合法 ECC 200 网格自动推断。当前自动化测试覆盖合成方形符号、合成矩形符号和合成候选检测；`samples/` 下 5 张 Data Matrix 拍照样本通过 ignored 诊断与标准样本逐模块比较，当前均为 24x24 且 `diff=0`。

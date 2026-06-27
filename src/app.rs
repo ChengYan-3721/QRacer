@@ -8,7 +8,8 @@
 
 use crate::code_kind::CodeKind;
 use crate::codec::data_matrix_grid::{
-    DataMatrixGrid, sample_data_matrix_grid, sample_data_matrix_grid_for_symbol,
+    DATA_MATRIX_SYMBOLS, DataMatrixGrid, DataMatrixSymbol, sample_data_matrix_grid,
+    sample_data_matrix_grid_for_symbols,
 };
 use crate::codec::dy_grid::{DyGrid, detect_dy_params, sample_dy, sample_dy_with_logos};
 use crate::codec::qr::{QrDecoded, QrEcc, QrMatrix, decode_qr, regenerate_qr};
@@ -931,7 +932,7 @@ impl QRacerApp {
         ));
         self.last_diff_count = Some(diff_count);
         self.status = format!(
-            "已识别 Data Matrix：{} x {} 模块；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+            "已识别 Data Matrix：{} x {} 模块；差异 {diff_count} 个模块（红色=原图有生成图没有，蓝色=原图没有生成图有）",
             grid.cols, grid.rows
         );
     }
@@ -1496,7 +1497,7 @@ fn process_data_matrix_image(
         preview,
     ));
     result.status = format!(
-        "已识别 Data Matrix：{} x {} 模块；差异 {diff_count} 个像素（红色=原图有生成图没有，蓝色=原图没有生成图有）",
+        "已识别 Data Matrix：{} x {} 模块；差异 {diff_count} 个模块（红色=原图有生成图没有，蓝色=原图没有生成图有）",
         best.grid.cols, best.grid.rows
     );
 }
@@ -1511,35 +1512,410 @@ fn best_data_matrix_processing_candidate(
     candidates: &[DataMatrixCandidate],
 ) -> Option<ProcessedDataMatrixCandidate> {
     let mut best: Option<(f64, ProcessedDataMatrixCandidate)> = None;
+    let max_side = candidates
+        .iter()
+        .copied()
+        .map(data_matrix_candidate_side)
+        .fold(0.0, f64::max);
+    let min_side = if max_side >= 80.0 {
+        max_side * 0.35
+    } else {
+        0.0
+    };
+
+    let mut processed_physical_candidates = Vec::new();
 
     for candidate in candidates.iter().take(8).copied() {
-        let (width, height) = data_matrix_warp_size(candidate);
-        let corrected_source = warp_corners_to_image(img, &candidate.corners, width, height);
-        let corrected_binary = preprocess(&corrected_source);
-        let Ok(grid) = sample_data_matrix_grid_for_symbol(&corrected_binary, candidate.symbol)
-            .or_else(|_| sample_data_matrix_grid(&corrected_binary))
-        else {
+        let side = data_matrix_candidate_side(candidate);
+        if side < min_side {
             continue;
-        };
-        let (_, diff_count) =
-            data_matrix_grid_to_diff_preview_image(&grid, &corrected_binary, false, PREVIEW_SIZE);
-        let pixel_total = (width as f64 * height as f64).max(1.0);
-        let score = grid.score + candidate.score * 0.10 - diff_count as f64 / pixel_total * 0.04;
-        if best
-            .as_ref()
-            .is_none_or(|(best_score, _)| score > *best_score)
+        }
+        if processed_physical_candidates
+            .iter()
+            .any(|existing| data_matrix_physical_candidates_overlap(*existing, candidate))
         {
-            best = Some((
-                score,
-                ProcessedDataMatrixCandidate {
-                    binary: corrected_binary,
-                    grid,
-                },
-            ));
+            continue;
+        }
+        processed_physical_candidates.push(candidate);
+
+        let corner_orders = if candidate.score >= 0.85 {
+            vec![candidate.corners]
+        } else {
+            data_matrix_corner_orderings(candidate.corners).to_vec()
+        };
+        let corner_scales = [1.0, 1.04, 0.96];
+        let symbol_hints = data_matrix_processing_symbol_hints(candidate, side, max_side);
+
+        for ordered_corners in corner_orders {
+            let mut order_has_confident_grid = false;
+            for corner_scale in corner_scales {
+                let mut scale_has_very_confident_grid = false;
+                let corners = scaled_data_matrix_corners(&ordered_corners, corner_scale);
+                let (width, height) = data_matrix_warp_size(candidate);
+                let corrected_source = warp_corners_to_image(img, &corners, width, height);
+                let corrected_binary = preprocess(&corrected_source);
+                let corrected_binary = if candidate.score < 0.85 {
+                    let (_, refined_binary) =
+                        refine_data_matrix_corrected_source(corrected_source, corrected_binary);
+                    refined_binary
+                } else {
+                    corrected_binary
+                };
+
+                let mut grids: Vec<DataMatrixGrid> = match sample_data_matrix_grid_for_symbols(
+                    &corrected_binary,
+                    symbol_hints.iter().copied(),
+                ) {
+                    Ok(grid) => vec![grid],
+                    Err(_) => Vec::new(),
+                };
+                if grids.is_empty() {
+                    if let Ok(grid) = sample_data_matrix_grid(&corrected_binary) {
+                        grids.push(grid);
+                    }
+                }
+
+                for grid in grids {
+                    let side_ratio = if max_side > f64::EPSILON {
+                        (side / max_side).min(1.0)
+                    } else {
+                        1.0
+                    };
+                    let corner_scale_penalty = (corner_scale - 1.0_f64).abs() * 0.22;
+                    let undersampling_penalty =
+                        data_matrix_square_undersampling_penalty(&grid, side);
+                    let score = grid.score + candidate.score * 0.10 + side_ratio * 0.12
+                        - corner_scale_penalty
+                        - undersampling_penalty;
+                    if is_confident_data_matrix_result(score, &grid, side_ratio) {
+                        order_has_confident_grid = true;
+                    }
+                    if is_very_confident_data_matrix_result(score, &grid, side_ratio) {
+                        scale_has_very_confident_grid = true;
+                    }
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_score, _)| score > *best_score)
+                    {
+                        best = Some((
+                            score,
+                            ProcessedDataMatrixCandidate {
+                                binary: corrected_binary.clone(),
+                                grid,
+                            },
+                        ));
+                    }
+                }
+                if scale_has_very_confident_grid {
+                    break;
+                }
+            }
+            if order_has_confident_grid {
+                break;
+            }
         }
     }
 
     best.map(|(_, processed)| processed)
+}
+
+fn data_matrix_corner_orderings(corners: [(f64, f64); 4]) -> [[(f64, f64); 4]; 4] {
+    let [a, b, c, d] = corners;
+    [[a, b, c, d], [d, c, b, a], [b, d, a, c], [c, a, d, b]]
+}
+
+fn is_confident_data_matrix_result(score: f64, grid: &DataMatrixGrid, side_ratio: f64) -> bool {
+    side_ratio >= 0.75 && grid.score >= 0.98 && score >= 1.12
+}
+
+fn is_very_confident_data_matrix_result(
+    score: f64,
+    grid: &DataMatrixGrid,
+    side_ratio: f64,
+) -> bool {
+    side_ratio >= 0.75 && grid.score >= 1.03 && score >= 1.24
+}
+
+fn data_matrix_processing_symbol_hints(
+    candidate: DataMatrixCandidate,
+    side: f64,
+    max_side: f64,
+) -> Vec<DataMatrixSymbol> {
+    let mut symbols = Vec::new();
+    push_data_matrix_symbol_hint(&mut symbols, candidate.symbol);
+
+    let top = data_matrix_corner_distance(candidate.corners[0], candidate.corners[1]);
+    let bottom = data_matrix_corner_distance(candidate.corners[2], candidate.corners[3]);
+    let left = data_matrix_corner_distance(candidate.corners[0], candidate.corners[2]);
+    let right = data_matrix_corner_distance(candidate.corners[1], candidate.corners[3]);
+    let width = (top + bottom) * 0.5;
+    let height = (left + right) * 0.5;
+    let aspect = width / height.max(f64::EPSILON);
+    let is_large_square =
+        side >= max_side * 0.75 && side >= 180.0 && (0.75..=1.33).contains(&aspect);
+
+    if is_large_square && candidate.score < 0.85 {
+        for modules in [22, 24, 26] {
+            if let Some(symbol) = DATA_MATRIX_SYMBOLS
+                .iter()
+                .copied()
+                .find(|symbol| symbol.rows == modules && symbol.cols == modules)
+            {
+                push_data_matrix_symbol_hint(&mut symbols, symbol);
+            }
+        }
+    }
+
+    symbols
+}
+
+fn push_data_matrix_symbol_hint(symbols: &mut Vec<DataMatrixSymbol>, symbol: DataMatrixSymbol) {
+    if !symbols.contains(&symbol) {
+        symbols.push(symbol);
+    }
+}
+
+fn refine_data_matrix_corrected_source(
+    source: DynamicImage,
+    binary: BinaryImage,
+) -> (DynamicImage, BinaryImage) {
+    let Some(corners) = refined_data_matrix_corners(&binary) else {
+        return (source, binary);
+    };
+    let width = source.width();
+    let height = source.height();
+    let refined_source = warp_corners_to_image(&source, &corners, width, height);
+    let refined_binary = preprocess(&refined_source);
+    (refined_source, refined_binary)
+}
+
+fn refined_data_matrix_corners(binary: &BinaryImage) -> Option<[(f64, f64); 4]> {
+    if binary.w < 64 || binary.h < 64 {
+        return None;
+    }
+
+    let left = fit_x_from_y(&collect_left_edge_points(binary)?)?;
+    let right = fit_x_from_y(&collect_right_edge_points(binary)?)?;
+    let top = fit_y_from_x(&collect_top_edge_points(binary)?)?;
+    let bottom = fit_y_from_x(&collect_bottom_edge_points(binary)?)?;
+
+    let corners = [
+        intersect_x_from_y_with_y_from_x(left, top)?,
+        intersect_x_from_y_with_y_from_x(right, top)?,
+        intersect_x_from_y_with_y_from_x(left, bottom)?,
+        intersect_x_from_y_with_y_from_x(right, bottom)?,
+    ];
+
+    let width = binary.w as f64;
+    let height = binary.h as f64;
+    let max_margin = width.max(height) * 0.08;
+    if corners.iter().any(|&(x, y)| {
+        x < -max_margin || y < -max_margin || x > width + max_margin || y > height + max_margin
+    }) {
+        return None;
+    }
+
+    let top_len = data_matrix_corner_distance(corners[0], corners[1]);
+    let bottom_len = data_matrix_corner_distance(corners[2], corners[3]);
+    let left_len = data_matrix_corner_distance(corners[0], corners[2]);
+    let right_len = data_matrix_corner_distance(corners[1], corners[3]);
+    let avg_w = (top_len + bottom_len) * 0.5;
+    let avg_h = (left_len + right_len) * 0.5;
+    if avg_w < width * 0.45 || avg_h < height * 0.45 {
+        return None;
+    }
+    let aspect = avg_w / avg_h.max(f64::EPSILON);
+    if !(0.50..=2.00).contains(&aspect) {
+        return None;
+    }
+
+    Some(corners)
+}
+
+fn collect_left_edge_points(binary: &BinaryImage) -> Option<Vec<(f64, f64)>> {
+    let mut points = Vec::new();
+    let max_x = (binary.w as usize * 45 / 100).max(1);
+    for y in 0..binary.h as usize {
+        for x in 0..max_x.min(binary.w as usize) {
+            if binary.is_black(x as i32, y as i32) {
+                points.push((x as f64, y as f64));
+                break;
+            }
+        }
+    }
+    (points.len() >= binary.h as usize / 5).then_some(points)
+}
+
+fn collect_right_edge_points(binary: &BinaryImage) -> Option<Vec<(f64, f64)>> {
+    let mut points = Vec::new();
+    let min_x = binary.w as usize * 55 / 100;
+    for y in 0..binary.h as usize {
+        for x in (min_x..binary.w as usize).rev() {
+            if binary.is_black(x as i32, y as i32) {
+                points.push((x as f64, y as f64));
+                break;
+            }
+        }
+    }
+    (points.len() >= binary.h as usize / 8).then_some(points)
+}
+
+fn collect_top_edge_points(binary: &BinaryImage) -> Option<Vec<(f64, f64)>> {
+    let mut points = Vec::new();
+    let max_y = (binary.h as usize * 18 / 100).max(1);
+    for x in 0..binary.w as usize {
+        for y in 0..max_y.min(binary.h as usize) {
+            if binary.is_black(x as i32, y as i32) {
+                points.push((x as f64, y as f64));
+                break;
+            }
+        }
+    }
+    (points.len() >= binary.w as usize / 8).then_some(points)
+}
+
+fn collect_bottom_edge_points(binary: &BinaryImage) -> Option<Vec<(f64, f64)>> {
+    let mut points = Vec::new();
+    let min_y = binary.h as usize * 55 / 100;
+    for x in 0..binary.w as usize {
+        for y in (min_y..binary.h as usize).rev() {
+            if binary.is_black(x as i32, y as i32) {
+                points.push((x as f64, y as f64));
+                break;
+            }
+        }
+    }
+    (points.len() >= binary.w as usize / 5).then_some(points)
+}
+
+fn fit_x_from_y(points: &[(f64, f64)]) -> Option<(f64, f64)> {
+    fit_line(points, |(x, y)| (y, x))
+}
+
+fn fit_y_from_x(points: &[(f64, f64)]) -> Option<(f64, f64)> {
+    fit_line(points, |(x, y)| (x, y))
+}
+
+fn fit_line<F>(points: &[(f64, f64)], map: F) -> Option<(f64, f64)>
+where
+    F: Fn((f64, f64)) -> (f64, f64) + Copy,
+{
+    if points.len() < 8 {
+        return None;
+    }
+    let mut mapped = points.iter().copied().map(map).collect::<Vec<_>>();
+    let mut line = linear_regression(&mapped)?;
+
+    for _ in 0..2 {
+        let mut residuals = mapped
+            .iter()
+            .map(|&(input, output)| (output - (line.0 * input + line.1)).abs())
+            .collect::<Vec<_>>();
+        residuals.sort_by(|a, b| a.total_cmp(b));
+        let cutoff = residuals[residuals.len() * 7 / 10].max(2.0);
+        mapped.retain(|&(input, output)| (output - (line.0 * input + line.1)).abs() <= cutoff);
+        line = linear_regression(&mapped)?;
+    }
+
+    Some(line)
+}
+
+fn linear_regression(points: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if points.len() < 8 {
+        return None;
+    }
+    let n = points.len() as f64;
+    let sum_x = points.iter().map(|point| point.0).sum::<f64>();
+    let sum_y = points.iter().map(|point| point.1).sum::<f64>();
+    let mean_x = sum_x / n;
+    let mean_y = sum_y / n;
+    let var_x = points
+        .iter()
+        .map(|point| {
+            let dx = point.0 - mean_x;
+            dx * dx
+        })
+        .sum::<f64>();
+    if var_x <= f64::EPSILON {
+        return None;
+    }
+    let cov_xy = points
+        .iter()
+        .map(|point| (point.0 - mean_x) * (point.1 - mean_y))
+        .sum::<f64>();
+    let slope = cov_xy / var_x;
+    let intercept = mean_y - slope * mean_x;
+    Some((slope, intercept))
+}
+
+fn intersect_x_from_y_with_y_from_x(
+    x_from_y: (f64, f64),
+    y_from_x: (f64, f64),
+) -> Option<(f64, f64)> {
+    let (mx, bx) = x_from_y;
+    let (my, by) = y_from_x;
+    let denom = 1.0 - mx * my;
+    if denom.abs() <= 1e-6 {
+        return None;
+    }
+    let y = (my * bx + by) / denom;
+    let x = mx * y + bx;
+    Some((x, y))
+}
+
+fn data_matrix_candidate_side(candidate: DataMatrixCandidate) -> f64 {
+    let top = data_matrix_corner_distance(candidate.corners[0], candidate.corners[1]);
+    let bottom = data_matrix_corner_distance(candidate.corners[2], candidate.corners[3]);
+    let left = data_matrix_corner_distance(candidate.corners[0], candidate.corners[2]);
+    let right = data_matrix_corner_distance(candidate.corners[1], candidate.corners[3]);
+    ((top + bottom + left + right) * 0.25).max(1.0)
+}
+
+fn data_matrix_physical_candidates_overlap(a: DataMatrixCandidate, b: DataMatrixCandidate) -> bool {
+    let ac = data_matrix_candidate_center(a);
+    let bc = data_matrix_candidate_center(b);
+    let side = data_matrix_candidate_side(a)
+        .max(data_matrix_candidate_side(b))
+        .max(1.0);
+    let side_ratio = data_matrix_candidate_side(a).min(data_matrix_candidate_side(b)) / side;
+    side_ratio >= 0.75 && (ac.0 - bc.0).hypot(ac.1 - bc.1) < side * 0.12
+}
+
+fn data_matrix_candidate_center(candidate: DataMatrixCandidate) -> (f64, f64) {
+    let mut x = 0.0;
+    let mut y = 0.0;
+    for point in candidate.corners {
+        x += point.0;
+        y += point.1;
+    }
+    (x * 0.25, y * 0.25)
+}
+
+fn data_matrix_corner_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+fn data_matrix_square_undersampling_penalty(grid: &DataMatrixGrid, side: f64) -> f64 {
+    if grid.rows != grid.cols || grid.rows >= 24 || side < 300.0 {
+        return 0.0;
+    }
+    (24 - grid.rows) as f64 * 0.13
+}
+
+fn scaled_data_matrix_corners(corners: &[(f64, f64); 4], scale: f64) -> [(f64, f64); 4] {
+    if (scale - 1.0).abs() <= f64::EPSILON {
+        return *corners;
+    }
+    let center = corners
+        .iter()
+        .fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
+    let center = (center.0 * 0.25, center.1 * 0.25);
+    corners.map(|point| {
+        (
+            center.0 + (point.0 - center.0) * scale,
+            center.1 + (point.1 - center.1) * scale,
+        )
+    })
 }
 
 fn data_matrix_warp_size(candidate: DataMatrixCandidate) -> (u32, u32) {
@@ -2410,5 +2786,165 @@ impl eframe::App for QRacerApp {
             ui_.separator();
             ui::compare_view::show(ui_, self, ctx);
         });
+    }
+}
+
+#[cfg(test)]
+mod data_matrix_sample_regression_tests {
+    use super::*;
+    use std::path::Path;
+
+    const STANDARD_SAMPLE: &str = "samples/Data Matrix标准.jpg";
+    const PHOTO_SAMPLES: [&str; 5] = [
+        "samples/Data Matrix拍照1.jpg",
+        "samples/Data Matrix拍照2.jpg",
+        "samples/Data Matrix拍照3.jpg",
+        "samples/Data Matrix拍照4.jpg",
+        "samples/Data Matrix拍照5.jpg",
+    ];
+
+    #[test]
+    #[ignore]
+    fn print_data_matrix_photo_sample_diagnostics() {
+        let standard =
+            sample_data_matrix_path(Path::new(STANDARD_SAMPLE)).expect("standard sample");
+        println!(
+            "standard: candidates={} symbol={}x{} score={:.4}",
+            standard.candidates, standard.grid.cols, standard.grid.rows, standard.grid.score
+        );
+
+        let only_sample = std::env::var("DM_SAMPLE").ok();
+        let sample_paths = only_sample
+            .as_deref()
+            .map(|path| vec![path])
+            .unwrap_or_else(|| PHOTO_SAMPLES.to_vec());
+
+        for path in sample_paths {
+            let image = image::open(path).expect(path);
+            let binary = preprocess(&image);
+            let candidates = find_data_matrix_candidates(&binary);
+            println!("{path}: raw_candidates={}", candidates.len());
+            for (idx, candidate) in candidates.iter().take(12).enumerate() {
+                let width = ((candidate.corners[0].0 - candidate.corners[1].0)
+                    .hypot(candidate.corners[0].1 - candidate.corners[1].1)
+                    + (candidate.corners[2].0 - candidate.corners[3].0)
+                        .hypot(candidate.corners[2].1 - candidate.corners[3].1))
+                    * 0.5;
+                let height = ((candidate.corners[0].0 - candidate.corners[2].0)
+                    .hypot(candidate.corners[0].1 - candidate.corners[2].1)
+                    + (candidate.corners[1].0 - candidate.corners[3].0)
+                        .hypot(candidate.corners[1].1 - candidate.corners[3].1))
+                    * 0.5;
+                println!(
+                    "  candidate {idx}: symbol={}x{} score={:.4} size={width:.1}x{height:.1} corners={:?}",
+                    candidate.cols(),
+                    candidate.rows(),
+                    candidate.score,
+                    candidate.corners
+                );
+            }
+
+            match sample_data_matrix_image(&image, candidates.len(), &candidates) {
+                Ok(sampled) => {
+                    let diff = data_matrix_matrix_diff_count(&standard.grid, &sampled.grid)
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "symbol-size-mismatch".to_owned());
+                    println!(
+                        "  sampled: candidates={} symbol={}x{} score={:.4} diff={diff}",
+                        sampled.candidates,
+                        sampled.grid.cols,
+                        sampled.grid.rows,
+                        sampled.grid.score
+                    );
+                    let (_, preview_diff_count) = data_matrix_grid_to_diff_preview_image(
+                        &sampled.grid,
+                        &sampled.binary,
+                        false,
+                        PREVIEW_SIZE,
+                    );
+                    println!("  preview_diff_modules: {preview_diff_count}");
+                    if let Some(points) =
+                        data_matrix_matrix_diff_points(&standard.grid, &sampled.grid)
+                    {
+                        if !points.is_empty() {
+                            println!("  diff points: {points:?}");
+                            for &(x, y) in points.iter().take(12) {
+                                println!(
+                                    "    ({x},{y}) expected={} actual={}",
+                                    standard.grid.matrix[y][x], sampled.grid.matrix[y][x]
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    println!("{path}: {error}");
+                }
+            }
+        }
+    }
+
+    struct SampledDataMatrix {
+        candidates: usize,
+        grid: DataMatrixGrid,
+        binary: BinaryImage,
+    }
+
+    fn sample_data_matrix_path(path: &Path) -> std::result::Result<SampledDataMatrix, String> {
+        let image = image::open(path).map_err(|error| error.to_string())?;
+        let binary = preprocess(&image);
+        let candidates = find_data_matrix_candidates(&binary);
+        sample_data_matrix_image(&image, candidates.len(), &candidates)
+            .map_err(|error| format!("{error} in {}", path.display()))
+    }
+
+    fn sample_data_matrix_image(
+        image: &DynamicImage,
+        candidate_count: usize,
+        candidates: &[DataMatrixCandidate],
+    ) -> std::result::Result<SampledDataMatrix, String> {
+        let processed = best_data_matrix_processing_candidate(image, candidates)
+            .ok_or_else(|| "no sampleable Data Matrix candidate".to_owned())?;
+        Ok(SampledDataMatrix {
+            candidates: candidate_count,
+            grid: processed.grid,
+            binary: processed.binary,
+        })
+    }
+
+    fn data_matrix_matrix_diff_count(
+        expected: &DataMatrixGrid,
+        actual: &DataMatrixGrid,
+    ) -> Option<usize> {
+        if expected.rows != actual.rows || expected.cols != actual.cols {
+            return None;
+        }
+        Some(
+            expected
+                .matrix
+                .iter()
+                .zip(&actual.matrix)
+                .flat_map(|(expected_row, actual_row)| expected_row.iter().zip(actual_row))
+                .filter(|(expected, actual)| expected != actual)
+                .count(),
+        )
+    }
+
+    fn data_matrix_matrix_diff_points(
+        expected: &DataMatrixGrid,
+        actual: &DataMatrixGrid,
+    ) -> Option<Vec<(usize, usize)>> {
+        if expected.rows != actual.rows || expected.cols != actual.cols {
+            return None;
+        }
+        let mut points = Vec::new();
+        for y in 0..expected.rows {
+            for x in 0..expected.cols {
+                if expected.matrix[y][x] != actual.matrix[y][x] {
+                    points.push((x, y));
+                }
+            }
+        }
+        Some(points)
     }
 }
