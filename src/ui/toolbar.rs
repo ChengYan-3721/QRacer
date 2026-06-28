@@ -61,8 +61,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp, ctx: &egui::Context) {
 
         ui.separator();
 
-        if ui.button("支持").clicked() {
-            app.open_support();
+        if ui.button("关于").clicked() {
+            app.open_about();
         }
     });
 }

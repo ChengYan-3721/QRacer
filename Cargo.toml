@@ -8,7 +8,7 @@ description = "QR / WeChat mini-program / Douyin code screenshot vectorizer for 
 # GUI
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.32"
-egui_extras = { version = "0.32", features = ["image"] }
+egui_extras = { version = "0.32", features = ["image", "svg"] }
 
 # 图像编解码（PNG/JPG/BMP/WebP）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "ico", "webp"] }

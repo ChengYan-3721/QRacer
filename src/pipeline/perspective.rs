@@ -314,7 +314,17 @@ pub fn warp_image_corners_to_square(
     destination_corners: &[(f64, f64); 4],
     target_size: u32,
 ) -> DynamicImage {
-    let size = target_size.max(1);
+    warp_image_corners_to_size(image, destination_corners, target_size, target_size)
+}
+
+pub fn warp_image_corners_to_size(
+    image: &DynamicImage,
+    destination_corners: &[(f64, f64); 4],
+    target_width: u32,
+    target_height: u32,
+) -> DynamicImage {
+    let width = target_width.max(1);
+    let height = target_height.max(1);
     let src_max_x = image.width().saturating_sub(1) as f64;
     let src_max_y = image.height().saturating_sub(1) as f64;
     let src = [
@@ -326,13 +336,13 @@ pub fn warp_image_corners_to_square(
     let h = homography_from_4pts(&src, destination_corners);
     let Some(inv) = h.try_inverse() else {
         return DynamicImage::ImageRgba8(RgbaImage::from_pixel(
-            size,
-            size,
+            width,
+            height,
             Rgba([255, 255, 255, 255]),
         ));
     };
 
-    warp_image_with_inverse(image, &inv, size)
+    warp_image_with_inverse_size(image, &inv, width, height)
 }
 
 pub struct DyUprightCorrection {

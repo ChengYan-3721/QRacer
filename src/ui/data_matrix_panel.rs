@@ -9,6 +9,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
 
     ui.horizontal_wrapped(|ui| {
         ui.label("Data Matrix码：矩形网格采样");
+        if ui.button("手动校准").clicked() {
+            app.open_manual_calibration();
+        }
+
         let mut show_diff = app.show_diff_overlay;
         if ui.checkbox(&mut show_diff, "显示差异").changed() {
             app.set_show_diff_overlay(show_diff);

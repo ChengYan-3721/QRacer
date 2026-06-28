@@ -16,9 +16,9 @@ use app::QRacerApp;
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([860.0, 520.0])
-            .with_min_inner_size([860.0, 520.0])
-            .with_title("QRacer")
+            .with_inner_size([960.0, 560.0])
+            .with_min_inner_size([960.0, 560.0])
+            .with_title("QRacer 摹码")
             .with_icon(load_app_icon()),
         ..Default::default()
     };
@@ -31,10 +31,12 @@ fn main() -> eframe::Result<()> {
 }
 
 fn load_app_icon() -> egui::IconData {
-    let icon =
-        image::load_from_memory_with_format(include_bytes!("../logo.ico"), image::ImageFormat::Ico)
-            .expect("embedded logo.ico must be a valid ICO file")
-            .into_rgba8();
+    let icon = image::load_from_memory_with_format(
+        include_bytes!("../assets/logo.ico"),
+        image::ImageFormat::Ico,
+    )
+    .expect("embedded logo.ico must be a valid ICO file")
+    .into_rgba8();
     let (width, height) = icon.dimensions();
 
     egui::IconData {

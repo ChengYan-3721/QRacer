@@ -19,7 +19,12 @@ impl CodeKind {
         CodeKind::Douyin,
     ];
 
-    pub const MANUAL_CALIBRATION: [CodeKind; 2] = [CodeKind::WxMiniprogram, CodeKind::Douyin];
+    pub const MANUAL_CALIBRATION: [CodeKind; 4] = [
+        CodeKind::Qr,
+        CodeKind::DataMatrix,
+        CodeKind::WxMiniprogram,
+        CodeKind::Douyin,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -39,7 +44,10 @@ impl CodeKind {
     }
 
     pub fn can_manual_calibrate(self) -> bool {
-        matches!(self, CodeKind::WxMiniprogram | CodeKind::Douyin)
+        matches!(
+            self,
+            CodeKind::Qr | CodeKind::DataMatrix | CodeKind::WxMiniprogram | CodeKind::Douyin
+        )
     }
 }
 

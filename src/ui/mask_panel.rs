@@ -1,12 +1,24 @@
 use crate::app::{MaskChoice, QRacerApp};
+use crate::code_kind::CodeKind;
 use eframe::egui;
 
 pub fn show(ui: &mut egui::Ui, app: &mut QRacerApp) {
-    if app.warped.is_none() || app.qr_version.is_none() {
+    if app.code_kind != CodeKind::Qr {
         return;
     }
 
     ui.horizontal_wrapped(|ui| {
+        ui.label("QR:");
+        if ui.button("手动校准").clicked() {
+            app.open_manual_calibration();
+        }
+
+        if app.warped.is_none() || app.qr_version.is_none() {
+            return;
+        }
+
+        ui.separator();
+
         let has_decode = app.last_decoded.is_some();
         ui.label("掩膜：");
 

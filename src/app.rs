@@ -25,13 +25,14 @@ use crate::detect::finder_wx::{
 use crate::image_io;
 use crate::pipeline::perspective::{
     WxUprightAnchor, correct_dy_to_upright, detect_wx_badge_anchor, dy_upright_target_finders,
-    warp_corners_to_image, warp_dy_to_upright_binary, warp_image_corners_to_square,
-    warp_qr_to_square_image, warp_wx_to_upright_binary, warp_wx_to_upright_image,
-    wx_upright_target_finders,
+    warp_corners_to_image, warp_dy_to_upright_binary, warp_image_corners_to_size,
+    warp_image_corners_to_square, warp_qr_to_square_image, warp_wx_to_upright_binary,
+    warp_wx_to_upright_image, wx_upright_target_finders,
 };
 use crate::pipeline::preprocess::{BinaryImage, preprocess};
 use crate::screen_capture;
 use crate::ui;
+use crate::ui::manual_calibration::ManualCalibrationMessageKind;
 use crate::vector::diff::{DiffResult, compute_matrix_diff};
 use crate::vector::svg::{
     QrAppearance, data_matrix_grid_to_diff_preview_image, data_matrix_grid_to_preview_image,
@@ -144,7 +145,7 @@ pub struct QRacerApp {
     paste_shortcut_was_down: bool,
     processing_job: Option<ProcessingJob>,
     capture_job: Option<CaptureJob>,
-    support_dialog: ui::support_dialog::SupportDialog,
+    about_dialog: ui::about_dialog::AboutDialog,
     pub manual_calibration: ui::manual_calibration::ManualCalibrationState,
     next_job_id: u64,
 }
@@ -189,6 +190,7 @@ struct ProcessResult {
 impl QRacerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         Self {
             original: None,
@@ -215,14 +217,14 @@ impl QRacerApp {
             paste_shortcut_was_down: false,
             processing_job: None,
             capture_job: None,
-            support_dialog: ui::support_dialog::SupportDialog::new(),
+            about_dialog: ui::about_dialog::AboutDialog::new(),
             manual_calibration: ui::manual_calibration::ManualCalibrationState::new(),
             next_job_id: 0,
         }
     }
 
-    pub fn open_support(&mut self) {
-        self.support_dialog.open();
+    pub fn open_about(&mut self) {
+        self.about_dialog.open();
     }
 
     pub fn current_forced_or_detected_kind(&self) -> Option<CodeKind> {
@@ -275,17 +277,32 @@ impl QRacerApp {
             .unwrap_or(CodeKind::Douyin);
         self.manual_calibration
             .open_for(kind, (original.source.width(), original.source.height()));
+        self.manual_calibration.set_qr_version_hint(
+            self.qr_version
+                .or_else(|| self.last_decoded.as_ref().map(|decoded| decoded.version)),
+        );
+        self.manual_calibration.set_data_matrix_symbol_hint(
+            self.last_data_matrix_grid.as_ref().map(|grid| grid.symbol),
+        );
+        self.manual_calibration
+            .set_douyin_border_hint(self.last_dy_grid.as_ref().map(|grid| grid.has_border));
     }
 
     pub fn apply_manual_calibration(&mut self) {
+        self.manual_calibration
+            .set_message(ManualCalibrationMessageKind::Info, "正在应用手动校准...");
         let kind = self.manual_calibration.kind;
         if !kind.can_manual_calibrate() {
             self.status = String::from("当前码类型不需要手动校准");
+            self.manual_calibration
+                .set_message(ManualCalibrationMessageKind::Error, self.status.clone());
             return;
         }
 
         let Some(source) = self.original.as_ref().map(|loaded| loaded.source.clone()) else {
             self.status = String::from("没有可用于手动校准的原图");
+            self.manual_calibration
+                .set_message(ManualCalibrationMessageKind::Error, self.status.clone());
             return;
         };
 
@@ -293,31 +310,56 @@ impl QRacerApp {
             .width()
             .max(source.height())
             .clamp(PREVIEW_SIZE, 1600);
-        let destination_corners = self.manual_calibration.output_corners(target_size);
-        let corrected_source =
-            warp_image_corners_to_square(&source, &destination_corners, target_size);
-        let dy_border_hint = self
-            .last_dy_grid
-            .as_ref()
-            .is_some_and(|grid| grid.has_border);
+        let qr_version = self.manual_calibration.qr_version();
+        let data_matrix_symbol = self.manual_calibration.data_matrix_symbol();
+        let dy_border_hint = self.manual_calibration.douyin_has_border();
 
         self.processing_job = None;
-        self.code_kind_override = Some(kind);
         self.code_kind = kind;
         self.clear_recognition_artifacts();
 
         let result = match kind {
-            CodeKind::WxMiniprogram => self.process_manual_wx(corrected_source),
-            CodeKind::Douyin => self.process_manual_dy(corrected_source, dy_border_hint),
+            CodeKind::Qr => {
+                let destination_corners = self
+                    .manual_calibration
+                    .output_grid_corners_for_size(target_size, target_size);
+                let corrected_source =
+                    warp_image_corners_to_square(&source, &destination_corners, target_size);
+                self.process_manual_qr(corrected_source, qr_version)
+            }
+            CodeKind::DataMatrix => {
+                let (width, height) = data_matrix_symbol_warp_size(data_matrix_symbol);
+                let destination_corners = self
+                    .manual_calibration
+                    .output_grid_corners_for_size(width, height);
+                let corrected_source =
+                    warp_image_corners_to_size(&source, &destination_corners, width, height);
+                self.process_manual_data_matrix(corrected_source, data_matrix_symbol)
+            }
+            CodeKind::WxMiniprogram => {
+                let destination_corners = self.manual_calibration.output_corners(target_size);
+                let corrected_source =
+                    warp_image_corners_to_square(&source, &destination_corners, target_size);
+                self.process_manual_wx(corrected_source)
+            }
+            CodeKind::Douyin => {
+                let destination_corners = self.manual_calibration.output_corners(target_size);
+                let corrected_source =
+                    warp_image_corners_to_square(&source, &destination_corners, target_size);
+                self.process_manual_dy(corrected_source, dy_border_hint)
+            }
             _ => Err(String::from("当前码类型不需要手动校准")),
         };
 
         match result {
             Ok(()) => {
+                self.manual_calibration.clear_message();
                 self.manual_calibration.open = false;
             }
             Err(error) => {
-                self.status = error;
+                self.status = error.clone();
+                self.manual_calibration
+                    .set_message(ManualCalibrationMessageKind::Error, error);
             }
         }
     }
@@ -639,6 +681,108 @@ impl QRacerApp {
         self.last_diff_count = None;
     }
 
+    fn process_manual_qr(
+        &mut self,
+        corrected_source: DynamicImage,
+        selected_version: u8,
+    ) -> std::result::Result<(), String> {
+        let corrected_binary = preprocess(&corrected_source);
+        self.binary = Some(corrected_binary.clone());
+        self.warped = Some(corrected_binary.clone());
+        self.finders = None;
+
+        let mut reference_matrix = sample_qr_grid(&corrected_binary, selected_version)
+            .map_err(|error| format!("Manual QR sampling failed: {error}"))?;
+        self.qr_version = Some(selected_version);
+        self.qr_reference_matrix = Some(reference_matrix.clone());
+
+        match decode_qr(&corrected_source, Some(&corrected_binary)) {
+            Ok(decoded) => {
+                if decoded.version != selected_version {
+                    if let Ok(decoded_reference) =
+                        sample_qr_grid(&corrected_binary, decoded.version)
+                    {
+                        reference_matrix = decoded_reference;
+                        self.qr_version = Some(decoded.version);
+                    } else {
+                        self.qr_version = Some(selected_version);
+                    }
+                    self.qr_reference_matrix = Some(reference_matrix.clone());
+                }
+
+                if let Some(candidate) = choose_matching_qr_mask(&decoded, &reference_matrix) {
+                    let mut decoded = decoded.clone();
+                    decoded.ecc = candidate.ecc;
+                    let mask = candidate.mask;
+                    self.last_decoded = Some(decoded);
+                    self.mask_choice = MaskChoice::Mask(mask);
+                    self.matched_mask = Some(mask);
+                    let svg = self.qr_svg_for_matrix(&candidate.matrix);
+                    self.set_generated_artifacts(candidate.matrix, svg);
+                } else {
+                    self.last_decoded = Some(decoded);
+                    self.mask_choice = MaskChoice::GridFallback;
+                    self.matched_mask = None;
+                    let svg = self.qr_svg_for_matrix(&reference_matrix);
+                    self.set_generated_artifacts(reference_matrix, svg);
+                }
+            }
+            Err(error) => {
+                self.last_decoded = None;
+                self.mask_choice = MaskChoice::GridFallback;
+                self.matched_mask = None;
+                let svg = self.qr_svg_for_matrix(&reference_matrix);
+                self.set_generated_artifacts(reference_matrix, svg);
+                self.status = format!(
+                    "Manual QR calibration used V{selected_version} grid sampling; decode failed: {error}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_manual_data_matrix(
+        &mut self,
+        corrected_source: DynamicImage,
+        symbol: DataMatrixSymbol,
+    ) -> std::result::Result<(), String> {
+        let corrected_binary = preprocess(&corrected_source);
+        self.binary = Some(corrected_binary.clone());
+        self.warped = Some(corrected_binary.clone());
+        self.status = format!(
+            "正在手动校准 Data Matrix ({}x{})...",
+            symbol.cols, symbol.rows
+        );
+
+        let grid = sample_data_matrix_grid_for_symbols(&corrected_binary, [symbol]).or_else(|forced_error| {
+            let fallback_grid = sample_data_matrix_grid_for_symbols(
+                &corrected_binary,
+                DATA_MATRIX_SYMBOLS.iter().copied(),
+            );
+            fallback_grid.map_err(|fallback_error| {
+                format!(
+                    "手动校准 Data Matrix 失败：指定规格({}x{}) 采样失败：{forced_error}；自动重试失败：{fallback_error}",
+                    symbol.cols, symbol.rows
+                )
+            })
+        })?;
+
+        if grid.symbol != symbol {
+            self.manual_calibration
+                .set_data_matrix_symbol_hint(Some(grid.symbol));
+            self.status = format!(
+                "手动校准 Data Matrix 成功：已从 {}x{} 自动匹配到 {}x{}",
+                symbol.cols, symbol.rows, grid.symbol.cols, grid.symbol.rows
+            );
+        } else {
+            self.status = format!("手动校准 Data Matrix 成功：{}x{}", symbol.cols, symbol.rows);
+        }
+        let svg = data_matrix_grid_to_svg(&grid);
+        self.set_data_matrix_artifacts(grid, svg);
+        Ok(())
+    }
+
     fn process_manual_wx(
         &mut self,
         corrected_source: DynamicImage,
@@ -884,6 +1028,17 @@ impl QRacerApp {
         self.last_matrix = Some(matrix);
         self.last_svg = Some(svg);
         self.refresh_generated_preview();
+    }
+
+    fn set_data_matrix_artifacts(&mut self, grid: DataMatrixGrid, svg: String) {
+        self.last_matrix = None;
+        self.qr_reference_matrix = None;
+        self.matched_mask = None;
+        self.last_wx_grid = None;
+        self.last_dy_grid = None;
+        self.last_data_matrix_grid = Some(grid);
+        self.last_svg = Some(svg);
+        self.refresh_data_matrix_preview();
     }
 
     fn set_wx_artifacts(&mut self, grid: WxGrid, svg: String) {
@@ -1919,12 +2074,17 @@ fn scaled_data_matrix_corners(corners: &[(f64, f64); 4], scale: f64) -> [(f64, f
 }
 
 fn data_matrix_warp_size(candidate: DataMatrixCandidate) -> (u32, u32) {
-    let max_modules = candidate.rows().max(candidate.cols()).max(1) as u32;
+    data_matrix_module_warp_size(candidate.cols(), candidate.rows())
+}
+
+fn data_matrix_symbol_warp_size(symbol: DataMatrixSymbol) -> (u32, u32) {
+    data_matrix_module_warp_size(symbol.cols, symbol.rows)
+}
+
+fn data_matrix_module_warp_size(cols: usize, rows: usize) -> (u32, u32) {
+    let max_modules = rows.max(cols).max(1) as u32;
     let module_px = (PREVIEW_SIZE / max_modules).clamp(4, 64);
-    (
-        candidate.cols() as u32 * module_px,
-        candidate.rows() as u32 * module_px,
-    )
+    (cols as u32 * module_px, rows as u32 * module_px)
 }
 
 fn process_wx_image(
@@ -2759,7 +2919,7 @@ impl eframe::App for QRacerApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui_| {
             ui::toolbar::show(ui_, self, ctx);
         });
-        self.support_dialog.show(ctx);
+        self.about_dialog.show(ctx);
         ui::manual_calibration::show(ctx, self);
 
         // 底部状态栏

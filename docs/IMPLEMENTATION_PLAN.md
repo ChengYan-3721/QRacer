@@ -1012,7 +1012,7 @@ fn grid_sampling_recovers_perfect_qr() {
 
 ## 阶段 9：手动校准与码类型手动覆盖（已完成）
 
-**实现状态（2026-06-25）**：已完成。该阶段用于处理自动识别或自动采样不稳定的图片，重点覆盖小程序码和抖音码，尤其是无框版抖音码拍照图。
+**实现状态（2026-06-25，2026-06-28 扩展）**：已完成。该阶段用于处理自动识别或自动采样不稳定的图片，覆盖 QR、Data Matrix、小程序码和抖音码，尤其适合拍照图、局部形变图和自动码类型误判场景。
 
 **目标**：
 - 用户可手动指定码类型，避免自动判型把图片送入错误采样器。
@@ -1021,18 +1021,23 @@ fn grid_sampling_recovers_perfect_qr() {
 
 **已实现内容**：
 - `src/code_kind.rs` 新增 `CodeKind::PROCESSABLE` 和 `can_process()`，为工具栏和校准弹窗提供可处理码类型列表。
-- `src/ui/toolbar.rs` 新增码类型下拉：`自动识别 / 二维码 (QR) / Data Matrix码 / 小程序码 / 抖音码`。选择非自动项后，`QRacerApp::code_kind_override` 会驱动后续处理路径；手动校准弹窗只支持小程序码和抖音码。
+- `src/ui/toolbar.rs` 新增码类型下拉：`自动识别 / 二维码 (QR) / Data Matrix码 / 小程序码 / 抖音码`。选择非自动项后，`QRacerApp::code_kind_override` 会驱动后续处理路径；手动校准弹窗内切换类型或应用校准不会改写主工具栏覆盖状态，避免“自动识别”被校准流程意外改成固定码类型。
 - `src/ui/manual_calibration.rs` 新增手动校准弹窗：
   - 展示原图纹理和当前码类型的标准参考线。
-  - 小程序码显示三牛眼和径向参考圆；抖音码显示三同心定位点、编码/装饰环、右上徽标参考。
-  - 支持拖动整图移动、拖动四角透视变形、滚轮缩放、上方旋转手柄连续旋转，以及 `逆时针 1° / 顺时针 1°` 微调按钮。
+  - QR 显示按版本变化的模块网格、finder、timing 和 alignment pattern，并提供版本选择。
+  - Data Matrix 显示按 ECC 200 符号尺寸变化的 L 形 finder、交替 timing 边、region 分界和基础模块网格，并提供方形/矩形符号选择。
+  - 小程序码显示三牛眼、径向参考圆和右下徽标参考圈；抖音码显示三同心定位点、编码/装饰环、右上徽标参考，并可选择无框版/黑框版参考线。
+  - 支持拖动整图移动、拖动边框做水平/垂直缩放、拖动四角缩放、滚轮微调缩放、上方旋转手柄连续旋转，以及 `逆时针 1° / 顺时针 1°` 微调按钮。
+  - `Shift` + 拖动边框或四角做等比例缩放；`Ctrl` + 拖动四角才做自由透视变换。
   - 窗口内显示操作说明。
   - 支持 `Ctrl+Z` 和“撤销”按钮回退上一步几何操作；拖动和连续滚轮缩放按一次手势记录一条撤销历史。
-- `src/pipeline/perspective.rs` 新增 `warp_image_corners_to_square()`：把用户调整后的原图四角映射到标准正方形画布，输出校准后的彩色图。
+- `src/pipeline/perspective.rs` 新增 `warp_image_corners_to_square()` / `warp_image_corners_to_size()`：把用户调整后的原图四角映射到标准正方形或矩形画布，输出校准后的彩色图。
 - `src/app.rs` 新增手动校准应用路径：
+  - QR：按弹窗选择版本走网格采样；若解码得到不同版本且可采样，会更新为解码版本。
+  - Data Matrix：按弹窗选择的 ECC 200 符号尺寸采样，失败时再尝试合法尺寸兜底。
   - 小程序码：使用标准目标三牛眼，按 36/54/72 候选采样并择优。
-  - 抖音码：使用标准目标三同心圆，根据当前边框 hint 检测参数并走 `sample_dy_with_logos`。
-- `src/ui/wx_panel.rs` 和 `src/ui/dy_panel.rs` 将主操作按钮从“重新采样”替换为“手动校准”。旧 resample/process helper 保留为 `#[allow(dead_code)]` 的调试路径。
+  - 抖音码：使用标准目标三同心圆，根据弹窗内无框/黑框选择检测参数并走 `sample_dy_with_logos`。
+- `src/ui/mask_panel.rs`、`src/ui/data_matrix_panel.rs`、`src/ui/wx_panel.rs` 和 `src/ui/dy_panel.rs` 提供“手动校准”入口。小程序码和抖音码旧 resample/process helper 保留为 `#[allow(dead_code)]` 的调试路径。
 
 **验收已通过**：
 - `cargo fmt`
@@ -1040,9 +1045,8 @@ fn grid_sampling_recovers_perfect_qr() {
 - `cargo test`（当前普通测试中 30 个采样回归/诊断测试为 ignored）
 
 **后续可选增强**：
-- 抖音码手动校准弹窗可增加“黑框版 / 无框版”子类型选择，避免仅依赖最近一次 `last_dy_grid.has_border` 作为参考线 hint。
 - 可增加键盘微调（方向键平移、Shift 加速、Q/E 旋转）或角点数值输入，便于精细对齐。
-- QR 和 Data Matrix 暂不提供手动校准入口；二者依赖自动网格/尺寸推断和差异预览确认结果。
+- 可增加鼠标指针形态提示，让边框缩放、角点缩放、Ctrl 自由变换的可发现性更强。
 
 ---
 
@@ -1080,7 +1084,7 @@ fn grid_sampling_recovers_perfect_qr() {
 - `src/vector/svg.rs`：新增 `data_matrix_grid_to_svg()`、`data_matrix_grid_to_preview_image()`、`data_matrix_grid_to_diff_preview_image()`。
   - SVG 按采样矩阵逐黑模块输出 `<rect>`。
   - 差异预览按矩形网格映射回校正二值图，红/蓝含义沿用 QR。
-- `src/ui/data_matrix_panel.rs`：新增 Data Matrix 识别结果面板，提供“显示差异”、差异模块数和模块尺寸提示；不提供手动校准入口，因为 Data Matrix 的方形/矩形 symbol size 需要由合法 ECC 200 网格自动推断。
+- `src/ui/data_matrix_panel.rs`：新增 Data Matrix 识别结果面板，提供“显示差异”、差异模块数、模块尺寸提示和“手动校准”入口。手动校准时可显式选择合法 ECC 200 符号尺寸，参考线保留方形/矩形宽高比，应用后按指定矩形画布采样。
 - `src/app.rs`：新增 Data Matrix 自动处理路径。
   - 自动路径：检测候选 → 矩形透视校正原彩色图 → 重二值化 → 按候选 symbol 或自动推断采样 → SVG/预览/差异输出。
   - 低置信拍照候选会在初次矩形校正后拟合左/右/上/下四条外边界并二次 warp；高置信候选跳过该步骤，避免对已稳定样本引入抖动。
