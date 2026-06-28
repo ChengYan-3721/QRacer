@@ -1,6 +1,6 @@
 # QRacer 摹码
 
-<img src="assets/logo.svg" width="240" alt="支付宝"/>
+<img src="assets/logo.svg" width="240" alt="logo"/>
 
 
 
@@ -111,7 +111,6 @@ src/
 
 - `docs/ARCHITECTURE.md`：架构、数据流、算法和技术决策。
 - `docs/IMPLEMENTATION_PLAN.md`：阶段任务、验收标准和路线图。
-- `docs/DOUYIN_SAMPLING_STATUS.md`：抖音码拍照图采样状态和回归验证。
 
 ## ⚠️注意事项
 
@@ -132,3 +131,7 @@ src/
 |                         支付宝                          |                         微信支付                          |
 | :-----------------------------------------------------: | :-------------------------------------------------------: |
 | <img src="assets/alipay.jpg" width="160" alt="支付宝"/> | <img src="assets/wechat.png" width="160" alt="微信支付"/> |
+
+## 社区
+
+本开源项目已链接并认可 [LINUX DO 社区](https://linux.do/)。
